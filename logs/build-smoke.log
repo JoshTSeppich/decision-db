@@ -1,0 +1,28 @@
+21:48:32 [flop] sampling 5000 canonical classes
+21:48:32 [flop] computing EHS² histograms (100 MC samples each)
+21:49:44 [flop] 1000/5000 classes (14/s, ETA 4.8min)
+21:50:57 [flop] 2000/5000 classes (14/s, ETA 3.6min)
+21:52:14 [flop] 3000/5000 classes (14/s, ETA 2.5min)
+21:53:25 [flop] 4000/5000 classes (14/s, ETA 1.2min)
+21:54:36 [flop] 5000/5000 classes (14/s, ETA 0.0min)
+21:54:36 [flop] k-means with sorted-EMD, k=200
+21:54:38 [flop] wrote abstraction-smoke/buckets_flop.npz (5000 classes)
+21:54:38 [turn] sampling 5000 canonical classes
+21:54:38 [turn] computing EHS² histograms (100 MC samples each)
+21:55:45 [turn] 1000/5000 classes (15/s, ETA 4.5min)
+21:56:53 [turn] 2000/5000 classes (15/s, ETA 3.4min)
+21:58:00 [turn] 3000/5000 classes (15/s, ETA 2.2min)
+21:59:07 [turn] 4000/5000 classes (15/s, ETA 1.1min)
+22:00:15 [turn] 5000/5000 classes (15/s, ETA 0.0min)
+22:00:15 [turn] k-means with sorted-EMD, k=200
+22:00:17 [turn] wrote abstraction-smoke/buckets_turn.npz (5000 classes)
+22:00:17 [river] computing 8 preflop equity tiers
+22:00:19 [river] sampling 5000 canonical classes
+22:00:19 [river] computing OCHS features (8 tiers x 50 MC samples each)
+22:00:22 [river] 1000/5000 classes (347/s, ETA 0.2min)
+22:00:25 [river] 2000/5000 classes (339/s, ETA 0.1min)
+22:00:29 [river] 3000/5000 classes (325/s, ETA 0.1min)
+22:00:32 [river] 4000/5000 classes (324/s, ETA 0.1min)
+22:00:35 [river] 5000/5000 classes (317/s, ETA 0.0min)
+22:00:35 [river] k-means with L2, k=200
+22:00:36 [river] wrote abstraction-smoke/buckets_river.npz (5000 classes)

@@ -1,0 +1,44 @@
+# Python build / cache
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+build/
+dist/
+
+# Tooling caches
+.venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# OS / IDE
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# Training artifacts — large binary outputs, regenerable from
+# the training scripts. Keep training/ structure but exclude
+# checkpoint .pt files.
+training/*/iter_*.pt
+training/*/checkpoint_*.pt
+
+# Strategy DBs — large (~200MB each), regenerable from training.
+# If you ever want to track a specific shipping version, remove
+# it from this ignore and `git add -f strategy-pilot-vX.db`.
+*.db
+
+# Tiny verification artifacts that shouldn't survive between runs
+logs/tiny-verify-*.log
+logs/training-pilot-tiny-verify.log
+
+# Plan files written by Claude Code sessions
+/Users/joshuatseppich/.claude/plans/
+
+# /tmp artifacts that may have been written into the project
+/tmp/
+
+# Pyenv / virtualenv extras
+pip-log.txt
+pip-delete-this-directory.txt

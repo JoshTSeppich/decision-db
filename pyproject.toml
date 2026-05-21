@@ -1,0 +1,128 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pokerbot"
+version = "0.1.0"
+description = "Decision DB — NLHE bot system (cash + tournament, 6/8/9-max). See Spec.html."
+requires-python = ">=3.11"
+authors = [{ name = "Decision DB" }]
+license = { text = "Proprietary" }
+classifiers = [
+    "Private :: Do Not Upload",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: POSIX",
+    "Operating System :: MacOS",
+]
+dependencies = [
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+runtime = [
+    "pydantic>=2.6",
+    "msgpack>=1.0",
+    "lmdb>=1.4",
+    "websockets>=12.0",
+]
+train = [
+    "torch>=2.2",
+    "open-spiel>=1.5",
+    "pokerkit>=0.5",
+    "phevaluator>=0.5",
+]
+dev = [
+    "ruff>=0.4",
+    "mypy>=1.10",
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+]
+all = ["pokerbot[runtime,train,dev]"]
+
+[project.scripts]
+pokerbot = "pokerbot.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["pokerbot*"]
+
+# ─────────── ruff ───────────
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W", "F",   # pycodestyle + pyflakes
+    "I",              # isort
+    "B",              # bugbear
+    "UP",             # pyupgrade
+    "N",              # pep8-naming
+    "SIM",            # simplify
+    "RET",            # return
+    "PTH",            # pathlib over os.path
+    "ARG",            # unused arguments
+    "PIE",            # misc
+    "TCH",            # type-checking imports
+    "RUF",            # ruff-native
+]
+ignore = [
+    "E501",           # line length is owned by the formatter
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["ARG", "N802", "N803"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+docstring-code-format = true
+
+# ─────────── mypy (strict) ───────────
+[tool.mypy]
+python_version = "3.11"
+strict = true
+mypy_path = "src:scripts"
+explicit_package_bases = true
+namespace_packages = true
+warn_unreachable = true
+disallow_any_unimported = true
+show_error_codes = true
+pretty = true
+
+[[tool.mypy.overrides]]
+module = [
+    "msgpack.*",
+    "lmdb.*",
+    "open_spiel.*",
+    "pokerkit.*",
+    "phevaluator.*",
+]
+ignore_missing_imports = true
+
+# ─────────── pytest ───────────
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+]
+markers = [
+    "slow: requires real training/eval workload (deselect with -m 'not slow')",
+    "needs_train_deps: requires the [train] extra (torch, open-spiel, pokerkit, phevaluator)",
+    "needs_runtime_deps: requires the [runtime] extra (pydantic, msgpack, lmdb)",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["src/pokerbot"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
