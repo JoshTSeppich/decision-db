@@ -20,9 +20,10 @@ dist/
 
 # Training artifacts — large binary outputs, regenerable from
 # the training scripts. Keep training/ structure but exclude
-# checkpoint .pt files.
+# checkpoint .pt files and build logs from checkpoint→DB conversion.
 training/*/iter_*.pt
 training/*/checkpoint_*.pt
+training/*/build_*.log
 
 # Strategy DBs — large (~200MB each), regenerable from training.
 # If you ever want to track a specific shipping version, remove

@@ -1,0 +1,25 @@
+# Multi-size strategy DB mapping for the Batch 1 partial salvage.
+#
+# "real"     = trained policy for this size; the engine consults the DB.
+# "fallback" = no real policy for this size. Registration exists only so
+#              MultiSizeStrategyDB._route does not KeyError. Every exact
+#              get() and nearest_neighbor() against the registered DB will
+#              miss (table_size is in the infoset hash + the
+#              nearest_neighbor SQL filter), causing
+#              RuntimeAdapter.decide() to silently fall through to
+#              default_policy_action().
+#
+# The loader in scripts/serve.py:_load_multi_size_config expects scalar
+# string values under `sizes:`, so role is annotated only via comments.
+# Proxy targets are chosen to be "roughly close" to the real size for
+# self-documenting reasons; the proxy DB's actual rows are never read.
+
+sizes:
+  2: strategy-pilot-v3-9max.db                       # fallback (no real HU policy)
+  3: training/cloud-batch-1/pilot-v4-3-iter_0100.db  # real (3-max, iter 100/250, partial cloud salvage)
+  4: training/cloud-batch-1/pilot-v4-3-iter_0100.db  # fallback
+  5: strategy-pilot-v2.db                            # fallback
+  6: strategy-pilot-v2.db                            # real (6-max production baseline)
+  7: strategy-pilot-v2.db                            # fallback
+  8: strategy-pilot-v3-9max.db                       # fallback
+  9: strategy-pilot-v3-9max.db                       # real (9-max production baseline)
