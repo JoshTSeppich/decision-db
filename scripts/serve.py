@@ -44,6 +44,7 @@ from pokerbot.runtime.opponent import IdentityOpponentModel, OpponentModel
 from pokerbot.runtime.schema import GameStateRequest
 from pokerbot.strategy_db import open_db
 from pokerbot.strategy_db.dual import DualStrategyDB
+from pokerbot.strategy_db.multi_size import MultiSizeStrategyDB
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -229,23 +230,70 @@ def _to_db_url(arg: str) -> str:
     return f"sqlite:///{p}"
 
 
+def _load_multi_size_config(path: str) -> dict[int, str]:
+    """Parse a multi-size YAML config -> {table_size: absolute_db_path}.
+
+    Expected schema:
+        sizes:
+          2: /abs/path/strategy-pilot-v4-2.db
+          3: /abs/path/strategy-pilot-v4-3.db
+          ...
+    """
+    import yaml
+
+    cfg_path = Path(path).resolve()
+    if not cfg_path.exists():
+        raise SystemExit(f"ERROR: multi-size config not found at {cfg_path}")
+    raw = yaml.safe_load(cfg_path.read_text())
+    if not isinstance(raw, dict) or "sizes" not in raw:
+        raise SystemExit(
+            f"ERROR: multi-size config {cfg_path} must contain a top-level 'sizes' mapping"
+        )
+    sizes_raw = raw["sizes"]
+    if not isinstance(sizes_raw, dict) or not sizes_raw:
+        raise SystemExit(f"ERROR: 'sizes' in {cfg_path} must be a non-empty mapping")
+    out: dict[int, str] = {}
+    for key, value in sizes_raw.items():
+        try:
+            size = int(key)
+        except (TypeError, ValueError) as e:
+            raise SystemExit(f"ERROR: size key {key!r} in {cfg_path} is not an int") from e
+        out[size] = str(value)
+    return out
+
+
 def build_adapter(
     *,
-    db_path: str,
+    db_path: str | None,
     db_path_9max: str | None,
     abstraction_path: str | None,
     rng_seed: int | None,
+    multi_size_config_path: str | None = None,
 ) -> tuple[RuntimeAdapter, StrategyDB]:
     """Boot the adapter. Returns the adapter and the (top-level) StrategyDB
     so the caller can close it on shutdown.
+
+    Routing:
+      - `multi_size_config_path` set        -> MultiSizeStrategyDB (per-size DBs).
+      - `db_path_9max` set                  -> DualStrategyDB (6-max + 9-max).
+      - `db_path` only                      -> single underlying DB.
+    `multi_size_config_path` takes precedence over both other flags.
     """
     abstraction = AbstractionTables(path=abstraction_path)
-    primary = open_db(_to_db_url(db_path))
-    if db_path_9max is not None:
-        secondary = open_db(_to_db_url(db_path_9max))
-        db: StrategyDB = DualStrategyDB(primary, secondary)
+    db: StrategyDB
+    if multi_size_config_path is not None:
+        size_to_path = _load_multi_size_config(multi_size_config_path)
+        per_size_dbs = {size: open_db(_to_db_url(p)) for size, p in size_to_path.items()}
+        db = MultiSizeStrategyDB(per_size_dbs)
     else:
-        db = primary
+        if db_path is None:
+            raise SystemExit("ERROR: --db is required unless --multi-size-config is given")
+        primary = open_db(_to_db_url(db_path))
+        if db_path_9max is not None:
+            secondary = open_db(_to_db_url(db_path_9max))
+            db = DualStrategyDB(primary, secondary)
+        else:
+            db = primary
     adapter = RuntimeAdapter(
         db=db,
         abstraction=abstraction,
@@ -259,20 +307,28 @@ async def run_server(
     *,
     host: str,
     port: int,
-    db_path: str,
+    db_path: str | None,
     db_path_9max: str | None,
     abstraction_path: str,
     rng_seed: int | None,
+    multi_size_config_path: str | None = None,
     ready_event: asyncio.Event | None = None,
 ) -> None:
     log.info("loading abstraction from %s", abstraction_path)
-    log.info("loading primary DB %s", db_path)
-    if db_path_9max:
-        log.info("loading 9-max DB  %s  (dual-routing by table_size)", db_path_9max)
+    if multi_size_config_path is not None:
+        log.info(
+            "loading multi-size DB config %s  (per-table_size routing)",
+            multi_size_config_path,
+        )
+    else:
+        log.info("loading primary DB %s", db_path)
+        if db_path_9max:
+            log.info("loading 9-max DB  %s  (dual-routing by table_size)", db_path_9max)
     t0 = time.perf_counter()
     adapter, db = build_adapter(
         db_path=db_path,
         db_path_9max=db_path_9max,
+        multi_size_config_path=multi_size_config_path,
         abstraction_path=abstraction_path,
         rng_seed=rng_seed,
     )
@@ -311,12 +367,31 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
-    parser.add_argument("--db", required=True, help="primary StrategyDB (6-max)")
-    parser.add_argument("--db-9max", default=None, help="optional 9-max StrategyDB for dual routing")
+    parser.add_argument(
+        "--db",
+        default=None,
+        help="primary StrategyDB (6-max). Required unless --multi-size-config is given.",
+    )
+    parser.add_argument(
+        "--db-9max",
+        default=None,
+        help="optional 9-max StrategyDB for dual routing (ignored if --multi-size-config is set)",
+    )
+    parser.add_argument(
+        "--multi-size-config",
+        default=None,
+        help=(
+            "path to YAML mapping {table_size: db_path} for per-size routing via "
+            "MultiSizeStrategyDB. Overrides --db / --db-9max when set."
+        ),
+    )
     parser.add_argument("--abstraction-path", default="abstraction")
     parser.add_argument("--rng-seed", type=int, default=None)
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args(argv)
+
+    if args.db is None and args.multi_size_config is None:
+        parser.error("either --db or --multi-size-config must be provided")
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -330,6 +405,7 @@ def main(argv: list[str] | None = None) -> int:
             port=args.port,
             db_path=args.db,
             db_path_9max=args.db_9max,
+            multi_size_config_path=args.multi_size_config,
             abstraction_path=args.abstraction_path,
             rng_seed=args.rng_seed,
         )
