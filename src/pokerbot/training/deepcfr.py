@@ -272,9 +272,26 @@ class Trainer:
 
     # ───────── checkpoints ─────────
 
+    @staticmethod
+    def _reservoir_sidecar_path(path: Path) -> Path:
+        """Sidecar npz path for a given .pt checkpoint (iter_NNNN -> iter_NNNN_reservoirs.npz)."""
+        return path.with_name(f"{path.stem}_reservoirs.npz")
+
     def save_checkpoint(self, path: Path) -> None:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
+        # Reservoirs go to a sidecar .npz, written array-by-array as views so
+        # peak memory holds no full copy of any reservoir (the OOM that killed
+        # v4/v5 was in the monolithic torch.save path). The .pt keeps only the
+        # small model/rng/config payload.
+        npz_path = self._reservoir_sidecar_path(path)
+        arrays: dict[str, np.ndarray] = {}
+        for i, r in enumerate(self.advantage_reservoirs):
+            arrays.update(r.npz_arrays(f"adv{i}"))
+        arrays.update(self.policy_reservoir.npz_arrays("policy"))
+        # mypy can't prove a **dict[str, ndarray] splat won't supply the
+        # keyword-only `allow_pickle: bool`; every key here is a real array.
+        np.savez(npz_path, **arrays)  # type: ignore[arg-type]
         torch.save(
             {
                 "iter": self.iter,
@@ -283,14 +300,13 @@ class Trainer:
                 "rng_state": self.rng.getstate(),
                 "torch_rng_state": torch.get_rng_state(),
                 "numpy_rng_state": np.random.get_state(),
-                "advantage_reservoirs": [r.state_dict() for r in self.advantage_reservoirs],
-                "policy_reservoir": self.policy_reservoir.state_dict(),
                 "config": self.config,
             },
             path,
         )
 
     def load_checkpoint(self, path: Path) -> None:
+        path = Path(path)
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
         self.iter = int(ckpt["iter"])
         for net, state in zip(self.advantage_nets, ckpt["advantage_states"], strict=True):
@@ -299,9 +315,25 @@ class Trainer:
         self.rng.setstate(ckpt["rng_state"])
         torch.set_rng_state(ckpt["torch_rng_state"])
         np.random.set_state(ckpt["numpy_rng_state"])
-        for res, state in zip(self.advantage_reservoirs, ckpt["advantage_reservoirs"], strict=True):
-            res.load_state_dict(state)
-        self.policy_reservoir.load_state_dict(ckpt["policy_reservoir"])
+        if "advantage_reservoirs" in ckpt:
+            # Legacy monolithic format (pilot-v2 and earlier): reservoirs are
+            # pickled inline in the .pt.
+            for res, state in zip(
+                self.advantage_reservoirs, ckpt["advantage_reservoirs"], strict=True
+            ):
+                res.load_state_dict(state)
+            self.policy_reservoir.load_state_dict(ckpt["policy_reservoir"])
+        else:
+            # New split format: reservoirs live in the sidecar .npz.
+            npz_path = self._reservoir_sidecar_path(path)
+            if not npz_path.exists():
+                raise FileNotFoundError(
+                    f"checkpoint {path} is split-format but sidecar {npz_path} is missing"
+                )
+            with np.load(npz_path, allow_pickle=False) as npz:
+                for i, r in enumerate(self.advantage_reservoirs):
+                    r.load_npz_arrays(npz, f"adv{i}")
+                self.policy_reservoir.load_npz_arrays(npz, "policy")
 
 
 def make_test_config(

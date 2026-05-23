@@ -102,6 +102,62 @@ class Reservoir:
         self.size = size
         self.total_seen = int(state["total_seen"])
 
+    # ── streaming npz (sidecar) save/load ──
+    #
+    # The monolithic torch.save path above pickles each reservoir, and
+    # state_dict() .copy()s every sliced array first — peak memory during a
+    # checkpoint write is roughly live + one full copy + pickle buffer, which
+    # OOM-killed earlier runs under the cgroup limit. The pair below avoids
+    # both: npz_arrays() returns prefix-slice *views* (no copy) so np.savez can
+    # stream them array-by-array, and infoset_keys are packed into a numeric
+    # blob + lengths so the npz never needs allow_pickle.
+
+    def npz_arrays(self, prefix: str) -> dict[str, np.ndarray]:
+        """Return array *views* (no copy) for streaming into ``np.savez``.
+
+        Keys are namespaced by ``prefix`` so several reservoirs can share one
+        sidecar file. The float arrays are contiguous prefix slices, so
+        ``np.savez`` writes them without materializing a copy.
+        """
+        keys = self.infoset_keys
+        blob = (
+            np.frombuffer(b"".join(keys), dtype=np.uint8)
+            if keys
+            else np.zeros(0, dtype=np.uint8)
+        )
+        lens = np.fromiter((len(k) for k in keys), dtype=np.int64, count=len(keys))
+        return {
+            f"{prefix}_features": self.features[: self.size],
+            f"{prefix}_masks": self.masks[: self.size],
+            f"{prefix}_targets": self.targets[: self.size],
+            f"{prefix}_iter_weights": self.iter_weights[: self.size],
+            f"{prefix}_keys_blob": blob,
+            f"{prefix}_keys_lens": lens,
+            f"{prefix}_meta": np.array(
+                [self.size, self.total_seen, self.capacity], dtype=np.int64
+            ),
+        }
+
+    def load_npz_arrays(self, npz: Any, prefix: str) -> None:
+        """Restore reservoir state from an open ``np.load`` archive (no pickle)."""
+        size, total_seen, _capacity = (int(x) for x in npz[f"{prefix}_meta"])
+        if size > self.capacity:
+            raise ValueError(f"saved size {size} > capacity {self.capacity}")
+        self.features[:size] = npz[f"{prefix}_features"]
+        self.masks[:size] = npz[f"{prefix}_masks"]
+        self.targets[:size] = npz[f"{prefix}_targets"]
+        self.iter_weights[:size] = npz[f"{prefix}_iter_weights"]
+        blob = npz[f"{prefix}_keys_blob"].tobytes()
+        keys: list[bytes] = []
+        off = 0
+        for n in npz[f"{prefix}_keys_lens"]:
+            length = int(n)
+            keys.append(blob[off : off + length])
+            off += length
+        self.infoset_keys = keys
+        self.size = size
+        self.total_seen = total_seen
+
     def __len__(self) -> int:
         return self.size
 

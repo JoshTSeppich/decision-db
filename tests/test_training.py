@@ -173,6 +173,83 @@ def test_checkpoint_resume_matches_straight_training(tmp_path: Path) -> None:
         assert diff < 1e-4, f"{k} drift {diff:.6f} between straight and resumed runs"
 
 
+def test_reservoir_npz_roundtrip(tmp_path: Path) -> None:
+    """Reservoir survives the streaming-npz save/load with variable-length keys."""
+    rng = random.Random(7)
+    src = Reservoir(capacity=64, feature_dim=5, num_actions=3)
+    for i in range(40):  # partially filled, so size < capacity
+        src.add(
+            torch.rand(5),
+            torch.tensor([1.0, 1.0, 0.0]),
+            torch.rand(3),
+            float(i),
+            rng,
+            infoset_key=bytes([i % 4]) * (i % 7 + 1),  # variable-length keys
+        )
+
+    arrays = src.npz_arrays("policy")
+    np.savez(tmp_path / "r.npz", **arrays)  # type: ignore[arg-type]
+
+    dst = Reservoir(capacity=64, feature_dim=5, num_actions=3)
+    with np.load(tmp_path / "r.npz", allow_pickle=False) as npz:
+        dst.load_npz_arrays(npz, "policy")
+
+    assert dst.size == src.size
+    assert dst.total_seen == src.total_seen
+    assert dst.infoset_keys == src.infoset_keys
+    np.testing.assert_array_equal(dst.features[: dst.size], src.features[: src.size])
+    np.testing.assert_array_equal(dst.masks[: dst.size], src.masks[: src.size])
+    np.testing.assert_array_equal(dst.targets[: dst.size], src.targets[: src.size])
+    np.testing.assert_array_equal(
+        dst.iter_weights[: dst.size], src.iter_weights[: src.size]
+    )
+
+
+def test_checkpoint_writes_split_format(tmp_path: Path) -> None:
+    """save_checkpoint produces a small .pt (no reservoirs) plus a sidecar .npz."""
+    config = make_test_config(outer_iters=2, seed=99)
+    trainer = Trainer(config, KuhnPokerGame())
+    trainer.train(tmp_path / "run")
+
+    pt = tmp_path / "run" / "iter_0002.pt"
+    npz = tmp_path / "run" / "iter_0002_reservoirs.npz"
+    assert pt.exists() and npz.exists()
+
+    ckpt = torch.load(pt, map_location="cpu", weights_only=False)
+    assert "advantage_reservoirs" not in ckpt  # reservoirs moved to sidecar
+    assert "policy_reservoir" not in ckpt
+
+
+def test_checkpoint_loads_legacy_monolithic_format(tmp_path: Path) -> None:
+    """Backward compat: resume from an old-style checkpoint with inline reservoirs."""
+    config = make_test_config(outer_iters=3, seed=55)
+    trainer = Trainer(config, KuhnPokerGame())
+    trainer.train(tmp_path / "run")
+
+    # Fabricate a legacy monolithic checkpoint (reservoirs pickled inline).
+    legacy = tmp_path / "legacy.pt"
+    torch.save(
+        {
+            "iter": trainer.iter,
+            "advantage_states": [net.state_dict() for net in trainer.advantage_nets],
+            "policy_state": trainer.policy_net.state_dict(),
+            "rng_state": trainer.rng.getstate(),
+            "torch_rng_state": torch.get_rng_state(),
+            "numpy_rng_state": np.random.get_state(),
+            "advantage_reservoirs": [r.state_dict() for r in trainer.advantage_reservoirs],
+            "policy_reservoir": trainer.policy_reservoir.state_dict(),
+            "config": config,
+        },
+        legacy,
+    )
+
+    fresh = Trainer(config, KuhnPokerGame())
+    fresh.load_checkpoint(legacy)
+    assert fresh.iter == trainer.iter
+    assert fresh.policy_reservoir.size == trainer.policy_reservoir.size
+    assert fresh.policy_reservoir.infoset_keys == trainer.policy_reservoir.infoset_keys
+
+
 # ───────── 5. test_lbr_better_than_random ─────────
 
 
