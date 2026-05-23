@@ -250,6 +250,24 @@ def test_checkpoint_loads_legacy_monolithic_format(tmp_path: Path) -> None:
     assert fresh.policy_reservoir.infoset_keys == trainer.policy_reservoir.infoset_keys
 
 
+def test_run_metadata_saved_in_checkpoint(tmp_path: Path) -> None:
+    """run_metadata is written into the .pt alongside config (Fix 3)."""
+    config = make_test_config(outer_iters=1, seed=1)
+    meta = {"lru_max": 4_000_000, "advantage_buffer_size": 250_000, "policy_buffer_size": 1_000_000}
+    trainer = Trainer(config, KuhnPokerGame(), run_metadata=meta)
+    trainer.train(tmp_path / "run")
+
+    ckpt = torch.load(tmp_path / "run" / "iter_0001.pt", map_location="cpu", weights_only=False)
+    assert ckpt["run_metadata"] == meta
+    assert ckpt["config"] is not None  # not replaced by run_metadata
+
+    # Default (no run_metadata) stores None, not a crash.
+    plain = Trainer(config, KuhnPokerGame())
+    plain.train(tmp_path / "run2")
+    ckpt2 = torch.load(tmp_path / "run2" / "iter_0001.pt", map_location="cpu", weights_only=False)
+    assert ckpt2["run_metadata"] is None
+
+
 # ───────── 5. test_lbr_better_than_random ─────────
 
 

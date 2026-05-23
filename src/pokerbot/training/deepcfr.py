@@ -55,10 +55,15 @@ class Trainer:
         game: Game[Any],
         *,
         device: str = "cpu",
+        run_metadata: dict[str, Any] | None = None,
     ) -> None:
         self.config = config
         self.game = game
         self.device = torch.device(device)
+        # Free-form provenance saved into checkpoint metadata alongside `config`
+        # (e.g. lru_max, which lives in the abstraction layer and isn't part of
+        # DeepCFRConfig). None is stored as-is for checkpoints predating this.
+        self.run_metadata = run_metadata
 
         # Per-player advantage nets + reservoirs (standard Deep CFR layout).
         self.advantage_nets: list[nn.Module] = [
@@ -301,6 +306,7 @@ class Trainer:
                 "torch_rng_state": torch.get_rng_state(),
                 "numpy_rng_state": np.random.get_state(),
                 "config": self.config,
+                "run_metadata": self.run_metadata,
             },
             path,
         )

@@ -43,8 +43,34 @@ from pokerbot.abstraction import AbstractionTables
 from pokerbot.strategy_db import open_db
 from pokerbot.training import DeepCFRConfig, SimpleNLHEGame, Trainer
 
+# Buffer/cache sizes must be sane before we spend ~6s warming caches and load
+# the abstraction. Floor guards against fat-finger tiny values (a 100-entry
+# reservoir trains on noise); ceiling guards against an accidental extra zero
+# allocating tens of GB and OOM-killing the run.
+_BUFFER_MIN = 1_000
+_BUFFER_MAX = 100_000_000
 
-def main() -> int:
+
+def validate_buffer_args(args: argparse.Namespace) -> None:
+    """Reject out-of-range buffer/cache sizes with a clear, flag-named error.
+
+    Raises SystemExit(2) (the argparse convention) so the launcher exits
+    non-zero before any heavy work begins.
+    """
+    checks = (
+        ("--advantage-buffer-size", args.advantage_buffer_size),
+        ("--policy-buffer-size", args.policy_buffer_size),
+        # --lru-max and --lru-cache-size share dest `lru_max`.
+        ("--lru-max/--lru-cache-size", args.lru_max),
+    )
+    for flag, value in checks:
+        if value < _BUFFER_MIN or value > _BUFFER_MAX:
+            msg = f"error: {flag}={value} out of range [{_BUFFER_MIN}, {_BUFFER_MAX}]"
+            print(msg, file=sys.stderr)
+            raise SystemExit(2)
+
+
+def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser()
     p.add_argument("--out", type=Path, default=Path("training/pilot"))
     p.add_argument("--abstraction-dir", type=Path, default=Path("abstraction"))
@@ -83,9 +109,15 @@ def main() -> int:
     )
     p.add_argument(
         "--lru-max",
+        "--lru-cache-size",
+        dest="lru_max",
         type=int,
         default=2_000_000,
-        help="LRU cap on AbstractionTables miss-path cache",
+        help=(
+            "LRU cap on AbstractionTables miss-path cache. "
+            "--lru-cache-size is an alias for --lru-max (last one specified "
+            "wins); --lru-max is kept for back-compat with existing scripts."
+        ),
     )
     p.add_argument(
         "--skip-export",
@@ -97,7 +129,13 @@ def main() -> int:
         action="store_true",
         help="Disable in-loop LBR exploitability eval (use in CI smoke tests)",
     )
+    return p
+
+
+def main() -> int:
+    p = build_parser()
     args = p.parse_args()
+    validate_buffer_args(args)  # fail fast, before any heavy work
 
     logging.basicConfig(
         level=logging.INFO,
@@ -134,14 +172,21 @@ def main() -> int:
         advantage_buffer_size=args.advantage_buffer_size,
         policy_buffer_size=args.policy_buffer_size,
         checkpoint_every=args.checkpoint_every,
-        lbr_every=0 if args.skip_lbr else DeepCFRConfig.__dataclass_fields__["lbr_every"].default,
+        lbr_every=0 if args.skip_lbr else DeepCFRConfig().lbr_every,
         seed=args.seed,
     )
     log.info("config: %s", config)
 
     game = SimpleNLHEGame(tables, table_size=args.table_size)
     log.info("training at table_size=%d", args.table_size)
-    trainer = Trainer(config, game)
+    # lru_max lives in the abstraction layer, not DeepCFRConfig — record it
+    # (and the buffer sizes) in checkpoint metadata for run provenance.
+    run_metadata = {
+        "lru_max": args.lru_max,
+        "advantage_buffer_size": args.advantage_buffer_size,
+        "policy_buffer_size": args.policy_buffer_size,
+    }
+    trainer = Trainer(config, game, run_metadata=run_metadata)
 
     args.out.mkdir(parents=True, exist_ok=True)
     log.info("training -> %s/", args.out)
