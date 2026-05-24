@@ -46,7 +46,7 @@ from pokerbot.runtime import (
     GameStateRequest,
     RuntimeAdapter,
 )
-from pokerbot.strategy_db import open_db, unpack_probs
+from pokerbot.strategy_db import StrategyDB, open_db, unpack_probs
 from pokerbot.training import SimpleNLHEGame
 
 if TYPE_CHECKING:
@@ -309,11 +309,39 @@ def _print_sanity(
 # ───────── main ─────────
 
 
+def _open_opponent_db(opponent_db: str | None) -> StrategyDB:
+    """Open the opponent's strategy DB.
+
+    `None` → an empty in-memory DB with current version set, so every opponent
+    decision falls through to `default_policy_action` (the original behavior).
+    Otherwise the file-backed DB at `opponent_db`, opened like the trained DB.
+    """
+    if opponent_db is None:
+        db = open_db("sqlite:///:memory:")
+        db.set_current_version(1)
+        return db
+    return open_db(f"sqlite:///{Path(opponent_db).resolve()}")
+
+
+def _comparison_header(db: str, opponent_db: str | None, n_hands: int, table_size: int) -> str:
+    """Self-explanatory one-liner naming what's being compared, e.g.
+    'Evaluation: strategy-v5-6max vs strategy-pilot-v2 (50000 hands, 6-max)'."""
+    new_stem = Path(db).stem
+    opp_stem = Path(opponent_db).stem if opponent_db is not None else "default policy"
+    return f"Evaluation: {new_stem} vs {opp_stem} ({n_hands} hands, {table_size}-max)"
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--n-hands", type=int, default=1000)
     p.add_argument("--seed", type=int, default=2026)
     p.add_argument("--db", default="strategy-pilot.db")
+    p.add_argument(
+        "--opponent-db",
+        default=None,
+        help="opponent strategy DB file; when omitted the opponent uses an empty "
+        "in-memory DB (every decision falls through to default policy)",
+    )
     p.add_argument("--abstraction-dir", default="abstraction")
     p.add_argument("--starting-stack", type=int, default=1000)
     p.add_argument("--sb", type=int, default=5)
@@ -331,6 +359,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: trained DB not found at {db_path}", file=sys.stderr)
         return 2
 
+    if args.opponent_db is not None and not Path(args.opponent_db).resolve().exists():
+        print(
+            f"ERROR: opponent DB not found at {Path(args.opponent_db).resolve()}",
+            file=sys.stderr,
+        )
+        return 2
+
     print(f"Loading AbstractionTables from {args.abstraction_dir!r}…")
     t_load0 = time.perf_counter()
     abstraction = AbstractionTables(path=args.abstraction_dir)
@@ -343,8 +378,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  loaded in {time.perf_counter() - t_load0:.2f}s")
 
     trained_db = open_db(f"sqlite:///{db_path}")
-    default_db = open_db("sqlite:///:memory:")
-    default_db.set_current_version(1)
+    default_db = _open_opponent_db(args.opponent_db)
 
     trained_adapter = RuntimeAdapter(db=trained_db, abstraction=abstraction, rng_seed=args.seed)
     default_adapter = RuntimeAdapter(
@@ -401,7 +435,11 @@ def main(argv: list[str] | None = None) -> int:
         # already asserted per-hand; this is a redundant guard
         raise AssertionError("aggregate not zero-sum — side-pot bug")
 
+    header = _comparison_header(args.db, args.opponent_db, args.n_hands, args.table_size)
+    opp_label = "opponent" if args.opponent_db is not None else "default"
+
     print(f"\n── results over {args.n_hands} hands ──")
+    print(f"  {header}")
     print(f"  elapsed:  {elapsed:.1f}s  ({args.n_hands / elapsed:.1f} hands/sec)")
     print(f"  decisions: {total_decisions}  ({total_decisions / args.n_hands:.1f}/hand avg)")
     remap_frac = total_remaps / total_decisions if total_decisions else 0.0
@@ -413,10 +451,10 @@ def main(argv: list[str] | None = None) -> int:
         f"  trained mbb/hand:  {trained_mean:+8.2f}   95% CI [{trained_lo:+.2f}, {trained_hi:+.2f}]"
     )
     print(
-        f"  default mbb/hand:  {default_mean:+8.2f}   95% CI [{default_lo:+.2f}, {default_hi:+.2f}]"
+        f"  {opp_label} mbb/hand:  {default_mean:+8.2f}   95% CI [{default_lo:+.2f}, {default_hi:+.2f}]"
     )
     print(
-        f"  zero-sum check: trained+default = {trained_mean + default_mean:+.4f} mbb/hand (should be 0)"
+        f"  zero-sum check: trained+{opp_label} = {trained_mean + default_mean:+.4f} mbb/hand (should be 0)"
     )
 
     # Aggregate across streets for the headline summary.
@@ -461,6 +499,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # ── verdict ──
     print("\n── verdict ──")
+    print(f"  {header}")
     if trained_lo > 0 and trained_mean > 50.0:
         print("  PASS: trained > +50 mbb/hand and CI lower bound > 0 → pipeline learned.")
         return 0
