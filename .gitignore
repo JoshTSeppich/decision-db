@@ -3,7 +3,7 @@ __pycache__/
 *.pyc
 *.pyo
 *.egg-info/
-build/
+/build/
 dist/
 
 # Tooling caches
