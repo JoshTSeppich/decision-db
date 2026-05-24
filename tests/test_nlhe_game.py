@@ -12,10 +12,10 @@ Spec acceptance:
 from __future__ import annotations
 
 import random
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
-import torch  # noqa: F401 — imported so torch is importable in the test process
+import torch
 
 from pokerbot.abstraction import (
     AbstractionTables,
@@ -300,3 +300,123 @@ def test_trainer_runs_one_outer_iteration_on_nlhe(tmp_path: Path) -> None:
     total_adv = sum(len(r) for r in trainer.advantage_reservoirs)
     assert total_adv > 0
     assert len(trainer.policy_reservoir) > 0
+
+
+# ───────── 8. _clone_state guard (Phase 1.5) ─────────
+
+
+def _pk_snapshot(pk: Any) -> dict[str, Any]:
+    return {
+        "stacks": list(pk.stacks),
+        "bets": list(pk.bets),
+        "statuses": list(pk.statuses),
+        "board": [[repr(c) for c in b] for b in pk.board_cards],
+        "street_index": pk.street_index,
+        "status": pk.status,
+        "payoffs": list(pk.payoffs),
+        "actor_index": pk.actor_index,
+    }
+
+
+def _play_pk_to_terminal(pk: Any, rng: random.Random) -> None:
+    """Drive a raw pokerkit State to terminal, exercising raises too."""
+    guard = 0
+    while pk.status and pk.actor_index is not None:
+        guard += 1
+        if guard > 500:
+            raise RuntimeError("pk_state did not terminate")
+        roll = rng.random()
+        if pk.can_complete_bet_or_raise_to() and roll < 0.4:
+            lo = pk.min_completion_betting_or_raising_to_amount
+            hi = pk.max_completion_betting_or_raising_to_amount
+            if lo is not None and hi is not None and hi >= lo:
+                pk.complete_bet_or_raise_to(lo + (hi - lo) // 4)
+                continue
+        if pk.can_check_or_call() and roll < 0.85:
+            pk.check_or_call()
+        elif pk.can_fold():
+            pk.fold()
+        elif pk.can_check_or_call():
+            pk.check_or_call()
+        else:
+            break
+
+
+def test_clone_state_matches_deepcopy_and_isolates_parent() -> None:
+    """Guard: _clone_state must be bit-exact vs deepcopy and never leak into the parent.
+
+    A missed mutable field only diverges *after* mutation, so each trial plays
+    both clones to terminal with the same action sequence and re-checks the
+    parent. Catches a future pokerkit field that needs deeper copying.
+    """
+    import copy
+
+    from pokerbot.training.nlhe_game import _clone_state
+
+    game = SimpleNLHEGame(AbstractionTables(), table_size=6)
+    mismatches, isolation_breaks = 0, 0
+    trials = 60
+    for t in range(trials):
+        st = game.new_initial_state(random.Random(1000 + t))
+        depth = random.Random(t).randint(0, 4)
+        for k in range(depth):
+            if game.is_terminal(st):
+                break
+            st = game.apply_action(st, random.Random(t * 7 + k).choice(game.legal_actions(st)), random.Random(t))
+        if game.is_terminal(st):
+            continue
+        pk = st.pk_state
+        before = _pk_snapshot(pk)
+
+        d_clone = copy.deepcopy(pk)
+        c_clone = _clone_state(pk)
+        assert _pk_snapshot(pk) == before  # cloning didn't touch parent
+
+        _play_pk_to_terminal(d_clone, random.Random(9000 + t))
+        _play_pk_to_terminal(c_clone, random.Random(9000 + t))
+
+        if _pk_snapshot(d_clone) != _pk_snapshot(c_clone):
+            mismatches += 1
+        if _pk_snapshot(pk) != before:  # mutating clones must not touch parent
+            isolation_breaks += 1
+
+    assert mismatches == 0, f"{mismatches}/{trials} clones diverged from deepcopy"
+    assert isolation_breaks == 0, f"{isolation_breaks}/{trials} parent-mutation leaks"
+
+
+def test_clone_state_cfr_bit_exact_vs_deepcopy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end: training output is identical whether branches clone or deepcopy.
+
+    Trains the same tiny config twice from the same seed — once on the
+    deepcopy path, once on the clone path — and asserts advantage-net weights
+    match within 1e-4 (the test_checkpoint_resume tolerance).
+    """
+    from pokerbot.training import nlhe_game as ng
+
+    def train_with(use_deepcopy: bool) -> dict[str, torch.Tensor]:
+        monkeypatch.setattr(ng, "_USE_LEGACY_DEEPCOPY", use_deepcopy)
+        torch.manual_seed(0xC0FFEE)
+        config = make_test_config(
+            outer_iters=4,
+            traversals_per_iter=12,
+            train_steps_per_iter=15,
+            policy_train_steps=10,
+            batch_size=16,
+            advantage_buffer_size=512,
+            policy_buffer_size=512,
+            advantage_hidden=(16, 16),
+            policy_hidden=(16, 16),
+            checkpoint_every=10_000,
+            seed=2026,
+        )
+        trainer = Trainer(config, SimpleNLHEGame(AbstractionTables(), table_size=6))
+        trainer.train(tmp_path / ("dc" if use_deepcopy else "clone"))
+        return {k: v.clone() for k, v in trainer.advantage_nets[0].state_dict().items()}
+
+    deepcopy_w = train_with(True)
+    clone_w = train_with(False)
+    for k in deepcopy_w:
+        drift = float((deepcopy_w[k] - clone_w[k]).abs().max().item())
+        assert drift < 1e-4, f"{k} drifted {drift:.6f} between deepcopy and clone paths"

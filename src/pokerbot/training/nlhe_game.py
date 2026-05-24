@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import copy
 import random
+from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final, Literal
 
@@ -144,6 +145,49 @@ _AUTOMATIONS: Final[tuple[Automation, ...]] = (
 )
 
 
+# CFR branches by cloning the pokerkit State before each action. copy.deepcopy
+# is correct but ~22x slower than necessary: it recursively copies immutable
+# Card/Operation/Pot leaves and config tuples. `_clone_state` shallow-copies the
+# State (no __init__/__post_init__) and then copies only the mutable container
+# fields (list/deque/set), recursing one level for nested containers like
+# board_cards / hole_cards. Cards/Operations/Pots and config tuples are shared
+# by reference — validated safe in training/profiles/PHASE_1_5_SPIKE.md: State
+# has no cyclic refs, those leaves are immutable/self-contained, and the clone
+# is bit-exact vs deepcopy with zero parent-mutation leaks across 200 random
+# games played to terminal. Flip _USE_LEGACY_DEEPCOPY to fall back to deepcopy
+# (used by the bit-exact equivalence test and as a debugging escape hatch).
+_USE_LEGACY_DEEPCOPY: bool = False
+
+
+def _clone_state(pk: Any) -> Any:  # pokerkit State, kept opaque like NLHEState.pk_state
+    """Fast branch-clone of a pokerkit State (see _USE_LEGACY_DEEPCOPY note)."""
+    if _USE_LEGACY_DEEPCOPY:
+        return copy.deepcopy(pk)
+    new = copy.copy(pk)  # shallow: every field starts shared with the parent
+    for name, val in vars(pk).items():
+        # Replace each mutable container with a private copy so mutations on the
+        # clone (and pokerkit's automations) never reach the parent. Scalars and
+        # immutable tuples (config, antes/blinds/starting_stacks) stay shared.
+        if isinstance(val, list):
+            setattr(
+                new,
+                name,
+                [
+                    list(x)
+                    if isinstance(x, (list, deque))
+                    else set(x)
+                    if isinstance(x, set)
+                    else x
+                    for x in val
+                ],
+            )
+        elif isinstance(val, deque):
+            setattr(new, name, deque(val))
+        elif isinstance(val, set):
+            setattr(new, name, set(val))
+    return new
+
+
 # Compact infoset-features layout — kept tiny so a 256x3 MLP fits the spec budget.
 # Indexed as a flat float32 vector of length `FEATURE_DIM`.
 _FEATURE_HISTORY_BYTES: Final[int] = HISTORY_MAX  # 64
@@ -264,7 +308,7 @@ class SimpleNLHEGame(Game[NLHEState]):
         min_raise = max(min_raise_to - bet_actor, 0)
         chips_committed = resolve_action(matching, pot, stack, min_raise)
 
-        pk_new = copy.deepcopy(pk_old)
+        pk_new = _clone_state(pk_old)
         street_before = int(pk_new.street_index)
         if target_type == ActionType.FOLD:
             pk_new.fold()
