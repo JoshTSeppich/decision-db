@@ -16,7 +16,16 @@ diagnostic that motivated the policy_buffer_size bump):
     - LRU on AbstractionTables.lookup miss path capped at 2M entries
 
 Usage:
-    python scripts/launch_pilot_training.py [--out training/pilot] [--seed 2026]
+    python scripts/launch_pilot_training.py \
+        [--checkpoint-dir /tmp/pokerbot-checkpoints] [--seed 2026]
+    # resume a died run from its last good checkpoint:
+    python scripts/launch_pilot_training.py \
+        --checkpoint-dir /tmp/pokerbot-checkpoints \
+        --resume /tmp/pokerbot-checkpoints/iter_1000.pt
+
+Checkpoints land in --checkpoint-dir (a large LOCAL disk), never on a small
+mounted network volume — a full volume killing a multi-GB write is what
+motivated splitting checkpoints away from --out.
 
 Logs to stdout; redirect with `tee logs/training-pilot.log` when launching.
 After training, exports the policy reservoir into a SQLite strategy DB.
@@ -72,7 +81,38 @@ def validate_buffer_args(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser()
-    p.add_argument("--out", type=Path, default=Path("training/pilot"))
+    p.add_argument(
+        "--out",
+        type=Path,
+        default=Path("training/pilot"),
+        help=(
+            "Legacy run dir. Kept for back-compat; checkpoints no longer land "
+            "here — use --checkpoint-dir instead."
+        ),
+    )
+    p.add_argument(
+        "--checkpoint-dir",
+        type=Path,
+        default=Path("/tmp/pokerbot-checkpoints"),
+        help=(
+            "Directory where training checkpoints (iter_NNNN.pt + "
+            "iter_NNNN_reservoirs.npz) are written. Point this at LARGE LOCAL "
+            "container disk, NOT a small mounted network volume — a multi-GB "
+            "checkpoint write killed on a full 20 GB volume is what motivated "
+            "this flag. Default is an absolute local path; created if missing."
+        ),
+    )
+    p.add_argument(
+        "--resume",
+        type=Path,
+        default=None,
+        help=(
+            "Path to an iter_NNNN.pt checkpoint to resume from. Its sidecar "
+            "iter_NNNN_reservoirs.npz must sit alongside it. Training continues "
+            "from the checkpoint's iter and writes new checkpoints into "
+            "--checkpoint-dir."
+        ),
+    )
     p.add_argument("--abstraction-dir", type=Path, default=Path("abstraction"))
     p.add_argument("--db", default="sqlite:///strategy-pilot.db")
     p.add_argument("--strategy-version", type=int, default=1)
@@ -188,10 +228,13 @@ def main() -> int:
     }
     trainer = Trainer(config, game, run_metadata=run_metadata)
 
-    args.out.mkdir(parents=True, exist_ok=True)
-    log.info("training -> %s/", args.out)
+    args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    resume_from = Path(args.resume) if args.resume else None
+    log.info("checkpoints -> %s/", args.checkpoint_dir)
+    if resume_from is not None:
+        log.info("resuming from %s", resume_from)
     t0 = time.perf_counter()
-    trainer.train(args.out)
+    trainer.train(args.checkpoint_dir, resume_from=resume_from)
     log.info("trainer.train returned after %.1fmin", (time.perf_counter() - t0) / 60.0)
 
     # Lookup stats after training — informs whether the cache was big enough.
