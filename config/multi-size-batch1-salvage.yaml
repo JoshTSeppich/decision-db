@@ -19,7 +19,7 @@ sizes:
   3: training/cloud-batch-1/pilot-v4-3-iter_0100.db  # real (3-max, iter 100/250, partial cloud salvage)
   4: training/cloud-batch-1/pilot-v4-3-iter_0100.db  # fallback
   5: strategy-pilot-v2.db                            # fallback
-  6: strategy-pilot-v2.db                            # real (6-max production baseline)
+  6: training/v5-6max/strategy-v5-6max.db            # real (6-max production baseline, v5 — Run 1 deliverable)
   7: strategy-pilot-v2.db                            # fallback
   8: strategy-pilot-v3-9max.db                       # fallback
   9: strategy-pilot-v3-9max.db                       # real (9-max production baseline)
