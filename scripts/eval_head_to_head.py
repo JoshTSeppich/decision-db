@@ -346,7 +346,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--starting-stack", type=int, default=1000)
     p.add_argument("--sb", type=int, default=5)
     p.add_argument("--bb", type=int, default=10)
-    p.add_argument("--table-size", type=int, default=6, choices=[6, 8, 9])
+    p.add_argument("--table-size", type=int, default=6, choices=[2, 3, 4, 5, 6, 7, 8, 9])
     p.add_argument("--sanity-n", type=int, default=20)
     return p.parse_args(argv)
 

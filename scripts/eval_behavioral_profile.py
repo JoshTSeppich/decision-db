@@ -403,6 +403,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--starting-stack", type=int, default=1000)
     p.add_argument("--sb", type=int, default=5)
     p.add_argument("--bb", type=int, default=10)
+    p.add_argument("--table-size", type=int, default=6)
     args = p.parse_args(argv)
 
     db_path = Path(args.db).resolve()
@@ -435,7 +436,7 @@ def main(argv: list[str] | None = None) -> int:
             abstraction,
             blinds=(args.sb, args.bb),
             starting_stack=args.starting_stack,
-            table_size=6,
+            table_size=args.table_size,
         )
         rng = random.Random(seed)
 
