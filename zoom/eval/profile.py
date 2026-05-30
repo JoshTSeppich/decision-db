@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Final, cast
 
 from pokerbot.abstraction import ActionType, parse_card
+from pokerbot.abstraction.actions import legal_abstract_actions
 from pokerbot.abstraction.encoding import effective_stack, position_from_seats
 from pokerbot.runtime.adapter import _build_history_bytes
 from zoom.abstraction_gate import DEFAULT_SPR_CAP, effective_spr
@@ -58,14 +59,38 @@ SpotPolicy = Callable[["AgentSpot"], "Mapping[ActionType, float]"]
 _STREETS: Final[tuple[str, str, str, str]] = ("preflop", "flop", "turn", "river")
 _BOARD_LEN_TO_STREET_IDX: Final[dict[int, int]] = {0: 0, 3: 1, 4: 2, 5: 3}
 
+# Aggressive actions OTHER than ALL_IN. If any is legal, ALL_IN is a discretionary choice
+# (there was a real raise/bet alternative); if none is, ALL_IN is the ONLY legal aggression
+# (pot-committed forced jam) and shoving is structurally forced, not a leak.
+_NONALLIN_AGGRESSION: Final[frozenset[ActionType]] = frozenset(
+    {
+        ActionType.RAISE_2_5X,
+        ActionType.RAISE_3_5X,
+        ActionType.BET_33,
+        ActionType.BET_66,
+        ActionType.BET_100,
+        ActionType.BET_150,
+    }
+)
+
+
+def _preflop_forced_jam(pot: int, to_call: int, stack: int, min_raise: int) -> bool:
+    """True iff ALL_IN is the ONLY legal aggression preflop (pot-committed: the stack is
+    too short for any non-ALL_IN raise). Such shoves are structurally forced — folding is
+    clearly -EV — so they are NOT the indiscriminate-shoving leak the band targets, and are
+    excluded from the gated non-committed metric (raw ALL_IN% still reported)."""
+    base = legal_abstract_actions(pot, to_call, stack, min_raise, "preflop")
+    return not any(a.type in _NONALLIN_AGGRESSION for a in base)
+
 
 @dataclass(frozen=True)
 class BehavioralProfile:
     """The four gated metrics, read from the production `SideTotals` (+ preflop ALL_IN)."""
 
     totals: SideTotals
-    preflop_all_in_count: int
+    preflop_all_in_count: int  # raw: all preflop shoves (reported, NOT gated)
     hand_seats: int
+    noncommitted_all_in_count: int = 0  # preflop shoves that had a non-ALL_IN alternative
 
     @property
     def vpip_pct(self) -> float:
@@ -81,7 +106,15 @@ class BehavioralProfile:
 
     @property
     def all_in_preflop_pct(self) -> float:
+        """Raw preflop ALL_IN rate over all hand-seats (reported for transparency, NOT gated)."""
         return (self.preflop_all_in_count / self.hand_seats * 100.0) if self.hand_seats else 0.0
+
+    @property
+    def noncommitted_all_in_preflop_pct(self) -> float:
+        """Preflop shoves at spots that HAD a non-ALL_IN alternative, over all hand-seats —
+        the discretionary/indiscriminate-shoving leak. This is the GATED ALL_IN metric;
+        structurally-forced (pot-committed) jams are excluded."""
+        return (self.noncommitted_all_in_count / self.hand_seats * 100.0) if self.hand_seats else 0.0
 
     @classmethod
     def from_pcts(
@@ -91,9 +124,10 @@ class BehavioralProfile:
         pfr: float,
         all_in_preflop: float,
         fold_to_cbet: float,
+        noncommitted_all_in: float = 0.0,
         hands: int = 100,
     ) -> BehavioralProfile:
-        """Construct a profile with exactly the four given pcts (for band unit tests)."""
+        """Construct a profile with exactly the given pcts (for band unit tests)."""
         totals = SideTotals(
             hand_seats=hands,
             vpip_yes=round(vpip / 100.0 * hands),
@@ -105,6 +139,7 @@ class BehavioralProfile:
             totals=totals,
             preflop_all_in_count=round(all_in_preflop / 100.0 * hands),
             hand_seats=hands,
+            noncommitted_all_in_count=round(noncommitted_all_in / 100.0 * hands),
         )
 
 
@@ -155,12 +190,19 @@ class _SpotPolicyAdapter:
         self._policy = spot_policy
         self._rng = random.Random(seed)
         self.current_hand = 0
-        self.preflop_shoves: set[tuple[int, int]] = set()
+        self.preflop_shoves: set[tuple[int, int]] = set()  # ALL preflop shoves (raw)
+        # Preflop shoves at NON-committed spots (a non-ALL_IN raise was legal) — the
+        # discretionary-shoving leak the band gates on; forced jams are excluded here.
+        self.preflop_noncommitted_shoves: set[tuple[int, int]] = set()
 
     def decide(self, request: GameStateRequest) -> _Response:
         chosen = self._sample(self._policy(_spot_from_request(request)))
         if len(request.board) == 0 and chosen == ActionType.ALL_IN:
-            self.preflop_shoves.add((self.current_hand, request.hero_seat))
+            key = (self.current_hand, request.hero_seat)
+            self.preflop_shoves.add(key)
+            stack = request.stacks[request.hero_seat]
+            if not _preflop_forced_jam(request.pot_committed, request.to_call, stack, request.min_raise):
+                self.preflop_noncommitted_shoves.add(key)
         return _Response(abstract_action=chosen.name)
 
     def _sample(self, dist: Mapping[ActionType, float]) -> ActionType:
@@ -203,6 +245,7 @@ def profile_spot_policy(
         totals=merged,
         preflop_all_in_count=len(adapter.preflop_shoves),
         hand_seats=merged.hand_seats,
+        noncommitted_all_in_count=len(adapter.preflop_noncommitted_shoves),
     )
 
 

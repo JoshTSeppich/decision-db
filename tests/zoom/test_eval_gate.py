@@ -23,6 +23,7 @@ from zoom.eval import (
     profile_spot_policy,
     zero_all_in_at_deep_stacks,
 )
+from zoom.eval.profile import _preflop_forced_jam
 
 from pokerbot.abstraction import ActionType
 from pokerbot.training import SimpleNLHEGame
@@ -62,7 +63,7 @@ def test_should_be_better_allin_zeroed_scores_strictly_better() -> None:
         zero_all_in_at_deep_stacks(_over_aggressive), game, n_hands=200, seed=2026
     )
 
-    assert fixed_profile.all_in_preflop_pct < raw_profile.all_in_preflop_pct
+    assert fixed_profile.noncommitted_all_in_preflop_pct < raw_profile.noncommitted_all_in_preflop_pct
     assert band_score(fixed_profile) < band_score(raw_profile), (
         f"harness cannot distinguish fixed from raw: "
         f"raw={band_score(raw_profile):.2f} fixed={band_score(fixed_profile):.2f}"
@@ -79,7 +80,7 @@ def test_allin_metric_is_load_bearing_for_the_distinction() -> None:
     fixed = profile_spot_policy(
         zero_all_in_at_deep_stacks(_over_aggressive), game, n_hands=200, seed=2026
     )
-    allin_drop = raw.all_in_preflop_pct - fixed.all_in_preflop_pct
+    allin_drop = raw.noncommitted_all_in_preflop_pct - fixed.noncommitted_all_in_preflop_pct
     total_improvement = band_score(raw) - band_score(fixed)
     assert allin_drop > 0
     assert total_improvement >= allin_drop - 1e-6, (
@@ -140,7 +141,7 @@ def test_bands_pass_when_all_metrics_in_range() -> None:
     [
         (40, 22, 0, 55, "vpip_pct"),  # vpip too high
         (26, 5, 0, 55, "pfr_pct"),  # pfr too low
-        (26, 22, 12, 55, "all_in_preflop_pct"),  # shoves too much
+        (26, 22, 12, 55, "noncommitted_all_in_preflop_pct"),  # discretionary shoves too much
         (26, 22, 0, 20, "fold_to_cbet_pct"),  # folds too little
     ],
 )
@@ -150,7 +151,8 @@ def test_single_out_of_range_metric_forces_fail(
     """A single out-of-range metric forces FAIL — no averaging a bad metric away."""
     result = evaluate_bands(
         BehavioralProfile.from_pcts(
-            vpip=vpip, pfr=pfr, all_in_preflop=all_in, fold_to_cbet=fold_to_cbet
+            vpip=vpip, pfr=pfr, all_in_preflop=all_in, fold_to_cbet=fold_to_cbet,
+            noncommitted_all_in=all_in,  # the gated ALL_IN metric is the non-committed one
         )
     )
     assert not result.passed
@@ -167,3 +169,38 @@ def test_band_score_zero_iff_passed() -> None:
     )
     assert passing.score == 0.0 and passing.passed
     assert failing.score > 0.0 and not failing.passed
+
+
+# ─── ALL_IN band reframe: gate NON-COMMITTED shoves, exclude forced jams ───
+
+
+def test_forced_jam_shoves_do_not_fail_the_band() -> None:
+    """A policy whose preflop shoves are ALL structurally-forced jams (raw ALL_IN high,
+    non-committed 0) must PASS the ALL_IN band — forced jams are sound, not the leak."""
+    result = evaluate_bands(
+        BehavioralProfile.from_pcts(
+            vpip=26, pfr=22, all_in_preflop=12, noncommitted_all_in=0.0, fold_to_cbet=55
+        )
+    )
+    assert result.passed, result.failures
+    assert "noncommitted_all_in_preflop_pct" not in {m.name for m in result.failures}
+
+
+def test_noncommitted_shoves_fail_the_band() -> None:
+    """Discretionary (non-committed) preflop shoving above the threshold fails the band."""
+    result = evaluate_bands(
+        BehavioralProfile.from_pcts(
+            vpip=26, pfr=22, all_in_preflop=12, noncommitted_all_in=5.0, fold_to_cbet=55
+        )
+    )
+    assert not result.passed
+    assert "noncommitted_all_in_preflop_pct" in {m.name for m in result.failures}
+
+
+def test_preflop_forced_jam_excludes_committed_counts_discretionary() -> None:
+    """The classifier: a pot-committed spot (stack <= a min-raise, ALL_IN the only
+    aggression) is a forced jam (excluded); a deep spot with raises legal is not."""
+    # Committed: stack too short to make a non-ALL_IN raise -> forced.
+    assert _preflop_forced_jam(pot=100, to_call=50, stack=60, min_raise=50) is True
+    # Deep with alternatives: a 2.5x/3.5x raise is legal -> discretionary, counts.
+    assert _preflop_forced_jam(pot=15, to_call=10, stack=1000, min_raise=10) is False

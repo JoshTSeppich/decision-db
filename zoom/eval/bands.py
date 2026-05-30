@@ -19,11 +19,17 @@ if TYPE_CHECKING:
     from zoom.eval.profile import BehavioralProfile
 
 # Absolute Stage-1 bands (percent), inclusive ranges:
-#   VPIP 22-30, PFR 18-26, preflop ALL_IN <1%, fold-to-c-bet 50-60.
+#   VPIP 22-30, PFR 18-26, NON-COMMITTED preflop ALL_IN <1%, fold-to-c-bet 50-60.
+#
+# The ALL_IN band gates `noncommitted_all_in_preflop_pct` — shoves at spots that HAD a
+# non-ALL_IN raise/bet alternative — NOT the raw rate. Structurally-forced (pot-committed)
+# jams, where ALL_IN is the only legal aggression and folding is clearly -EV, are sound
+# play, not the v5 indiscriminate-shoving leak; counting them conflated forced correct
+# play with spew (measured the wrong thing). Raw `all_in_preflop_pct` is still reported.
 BANDS: Final[dict[str, tuple[float, float]]] = {
     "vpip_pct": (22.0, 30.0),
     "pfr_pct": (18.0, 26.0),
-    "all_in_preflop_pct": (0.0, 1.0),
+    "noncommitted_all_in_preflop_pct": (0.0, 1.0),
     "fold_to_cbet_pct": (50.0, 60.0),
 }
 
