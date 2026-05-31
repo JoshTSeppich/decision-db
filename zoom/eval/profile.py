@@ -74,6 +74,18 @@ _NONALLIN_AGGRESSION: Final[frozenset[ActionType]] = frozenset(
 )
 
 
+_FLOP_AGGRESSION_TYPES: Final[frozenset[str]] = frozenset({"bet", "raise", "all-in"})
+
+
+def _last_preflop_aggressor_seat(action_history: object) -> int | None:
+    """Seat of the last preflop bet/raise/ALL_IN entry, else None (limped pot)."""
+    last: int | None = None
+    for e in action_history:  # type: ignore[attr-defined]
+        if e.street == 0 and e.type in _FLOP_AGGRESSION_TYPES:
+            last = e.seat
+    return last
+
+
 def _preflop_forced_jam(pot: int, to_call: int, stack: int, min_raise: int) -> bool:
     """True iff ALL_IN is the ONLY legal aggression preflop (pot-committed: the stack is
     too short for any non-ALL_IN raise). Such shoves are structurally forced — folding is
@@ -91,6 +103,12 @@ class BehavioralProfile:
     preflop_all_in_count: int  # raw: all preflop shoves (reported, NOT gated)
     hand_seats: int
     noncommitted_all_in_count: int = 0  # preflop shoves that had a non-ALL_IN alternative
+    # Corrected fold-to-c-bet (counts ALL_IN c-bets and ALL multiway facers, which the
+    # production SideTotals tally drops — see `_SpotPolicyAdapter`). In 6-max the
+    # production `fold_to_cbet_pct` is a ~14x undercount for shove-heavy policies; use
+    # these. Both 0 when the gate runs without the corrected pass (back-compat).
+    facing_cbet_corrected_count: int = 0
+    fold_to_cbet_corrected_count: int = 0
 
     @property
     def vpip_pct(self) -> float:
@@ -108,6 +126,14 @@ class BehavioralProfile:
     def all_in_preflop_pct(self) -> float:
         """Raw preflop ALL_IN rate over all hand-seats (reported for transparency, NOT gated)."""
         return (self.preflop_all_in_count / self.hand_seats * 100.0) if self.hand_seats else 0.0
+
+    @property
+    def fold_to_cbet_corrected_pct(self) -> float:
+        """Fold-to-c-bet over the CORRECTED facing-c-bet set (ALL_IN c-bets + every
+        multiway facer included). Trustworthy where the production `fold_to_cbet_pct`
+        is not (6-max). NaN-safe: 0.0 when no facing-c-bet spots were observed."""
+        n = self.facing_cbet_corrected_count
+        return (self.fold_to_cbet_corrected_count / n * 100.0) if n else 0.0
 
     @property
     def noncommitted_all_in_preflop_pct(self) -> float:
@@ -194,6 +220,12 @@ class _SpotPolicyAdapter:
         # Preflop shoves at NON-committed spots (a non-ALL_IN raise was legal) — the
         # discretionary-shoving leak the band gates on; forced jams are excluded here.
         self.preflop_noncommitted_shoves: set[tuple[int, int]] = set()
+        # Corrected fold-to-c-bet: count every (hand, seat) that faces an UNRAISED flop
+        # c-bet by the preflop aggressor — including ALL_IN c-bets (history type
+        # "all-in", which the production tally's ("bet","raise") test drops) and every
+        # multiway facer (the production tally only counts the first, via len==1).
+        self.facing_cbet: set[tuple[int, int]] = set()
+        self.fold_to_cbet: set[tuple[int, int]] = set()
 
     def decide(self, request: GameStateRequest) -> _Response:
         chosen = self._sample(self._policy(_spot_from_request(request)))
@@ -203,7 +235,30 @@ class _SpotPolicyAdapter:
             stack = request.stacks[request.hero_seat]
             if not _preflop_forced_jam(request.pot_committed, request.to_call, stack, request.min_raise):
                 self.preflop_noncommitted_shoves.add(key)
+        elif len(request.board) == 3 and request.to_call > 0:
+            self._track_facing_cbet(request, chosen)
         return _Response(abstract_action=chosen.name)
+
+    def _track_facing_cbet(self, request: GameStateRequest, chosen: ActionType) -> None:
+        """Record a corrected facing-c-bet event: hero faces a bet on the flop, the
+        only flop aggression so far is the preflop aggressor's c-bet (calls in between
+        allowed → multiway facers counted), and hero isn't the c-bettor. ALL_IN c-bets
+        count (their history type is "all-in")."""
+        pf_aggr = _last_preflop_aggressor_seat(request.action_history)
+        if pf_aggr is None or request.hero_seat == pf_aggr:
+            return
+        flop_aggr = [
+            e for e in request.action_history
+            if e.street == 1 and e.type in _FLOP_AGGRESSION_TYPES
+        ]
+        if len(flop_aggr) != 1 or flop_aggr[0].seat != pf_aggr:
+            return
+        key = (self.current_hand, request.hero_seat)
+        if key in self.facing_cbet:
+            return
+        self.facing_cbet.add(key)
+        if chosen == ActionType.FOLD:
+            self.fold_to_cbet.add(key)
 
     def _sample(self, dist: Mapping[ActionType, float]) -> ActionType:
         items = [(a, p) for a, p in dist.items() if p > 0]
@@ -246,6 +301,8 @@ def profile_spot_policy(
         preflop_all_in_count=len(adapter.preflop_shoves),
         hand_seats=merged.hand_seats,
         noncommitted_all_in_count=len(adapter.preflop_noncommitted_shoves),
+        facing_cbet_corrected_count=len(adapter.facing_cbet),
+        fold_to_cbet_corrected_count=len(adapter.fold_to_cbet),
     )
 
 

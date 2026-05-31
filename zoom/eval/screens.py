@@ -55,7 +55,9 @@ def _prob_of(dist: Mapping[ActionType, float], types: Iterable[ActionType]) -> f
     return sum(max(0.0, dist.get(t, 0.0)) for t in types) / total
 
 
-def _spot(hole: tuple[int, int], *, position: int, to_call: int, pot: int) -> AgentSpot:
+def _spot(
+    hole: tuple[int, int], *, position: int, to_call: int, pot: int, table_size: int = 3
+) -> AgentSpot:
     from zoom.agents import AgentSpot
 
     return AgentSpot(
@@ -67,6 +69,7 @@ def _spot(hole: tuple[int, int], *, position: int, to_call: int, pot: int) -> Ag
         to_call=to_call,
         stack=_DEEP_STACK,
         min_raise=_BB,
+        table_size=table_size,
         # Effective stack a blinds-posted ~100bb table actually produces (opponent posted
         # the BB), so the probe queries the bucket the export wrote rather than the empty
         # full-stack bucket. Best-effort: a wrong guess yields a miss, which `_probe`
@@ -92,30 +95,42 @@ def _probe(policy: SpotPolicy, spot: AgentSpot, label: str) -> Mapping[ActionTyp
     return dist
 
 
-_BUTTON: Final[int] = 2  # SB-relative button position in 3-max (the first actor / opener)
+# SB-relative position of the FIRST preflop actor (seat immediately left of the BB):
+# always position 2 regardless of table size — it is the BUTTON in 3-max but UTG in
+# 6-max (SB=0, BB=1, first-to-act=2). This is the one spot a history-aware DB reads
+# faithfully, because only the first actor has an empty-history infoset.
+_FIRST_ACTOR_POSITION: Final[int] = 2
 
 
-def catastrophic_screen(policy: SpotPolicy) -> list[str]:
+def catastrophic_screen(policy: SpotPolicy, *, table_size: int = 3) -> list[str]:
     """Return a list of catastrophic-bug descriptions (empty = clean).
 
-    Probes the BUTTON OPEN (`history=b""`, first-in) — the one spot a history-aware DB
-    lookup reads faithfully, because only the first actor has an empty-history infoset.
-    SB/BB "facing a bet" probes are deliberately NOT synthesized: their real rows carry
-    a betting history this constructed spot can't reproduce, so the lookup would read a
-    non-representative row. `_probe` fails loud (`ScreenCoverageError`) on a miss, so the
-    screen can never silently pass a policy it didn't actually observe.
+    Probes the FIRST-IN OPEN (`history=b""`) at SB-relative position 2 — the BTN in
+    3-max, UTG in 6-max — the one spot a history-aware DB lookup reads faithfully,
+    because only the first actor has an empty-history infoset. `table_size` must match
+    the DB (a 6-max DB has no table_size=3 rows, so a 3-max probe would miss every row
+    and raise). SB/BB "facing a bet" probes are deliberately NOT synthesized: their real
+    rows carry a betting history this constructed spot can't reproduce, so the lookup
+    would read a non-representative row. `_probe` fails loud (`ScreenCoverageError`) on a
+    miss, so the screen can never silently pass a policy it didn't actually observe.
+
+    Note: at UTG (6-max) the 72o-open test is STRICTER than at the 3-max button — UTG's
+    sound opening range is ~15%, so opening 72o there is even more clearly a catastrophe.
     """
     violations: list[str] = []
+    pos = _FIRST_ACTOR_POSITION
 
     # AA must never be FOLDED as a first-in open.
-    aa = _probe(policy, _spot(_AA, position=_BUTTON, to_call=0, pot=3), "AA button-open")
+    aa = _probe(policy, _spot(_AA, position=pos, to_call=0, pot=3, table_size=table_size), "AA first-in open")
     if _prob_of(aa, {ActionType.FOLD}) > 0.5:
-        violations.append("folds AA preflop (button open)")
+        violations.append("folds AA preflop (first-in open)")
 
     # 72o must never be OPENED (raised) first-in.
-    junk = _probe(policy, _spot(_SEVEN_TWO_OFF, position=_BUTTON, to_call=0, pot=3), "72o button-open")
+    junk = _probe(
+        policy, _spot(_SEVEN_TWO_OFF, position=pos, to_call=0, pot=3, table_size=table_size), "72o first-in open"
+    )
     if _prob_of(junk, _RAISE_TYPES) > 0.5:
-        violations.append("opens 72o UTG (button open)")
+        violations.append("opens 72o first-in (early position)")
 
     return violations
 

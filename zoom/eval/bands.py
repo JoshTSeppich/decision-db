@@ -33,6 +33,39 @@ BANDS: Final[dict[str, tuple[float, float]]] = {
     "fold_to_cbet_pct": (50.0, 60.0),
 }
 
+# 6-max GATED bands. These are NOT the 3-max numbers: with 3 more players to act
+# behind, sound play folds more from early position, so VPIP/PFR run LOWER. They are
+# also calibrated to THIS self-play harness, not HUD/field conventions — a known-sound
+# scripted TAG (zoom.agents.archetypes.TagAgent) reads VPIP ~17 / PFR ~12 / nc-AI 0.0
+# in 6-handed self-play here (a full table of tight players makes few pots, which
+# compresses aggregate VPIP below the 22-30 HUD figures measured against a mixed field).
+# Validated against the scripted archetypes (zoom.agents.archetypes): TAG PASSES all
+# seeds; NIT (VPIP ~5, too tight), LAG (VPIP ~32, too loose), and STATION (VPIP ~67)
+# all FAIL — and the loose v5-6max blueprint (VPIP 40-51, nc-AI ~8) FAILs on vpip+nc-AI.
+#   * VPIP 15-28, PFR 11-22 — anchored on the TAG reference ± a reg spread (TAG ~17/12
+#     in band; LAG ~32 and v5 ~40-51 above the ceiling; NIT ~5 below the floor).
+#   * NON-COMMITTED preflop ALL_IN <1% — SEAT-COUNT-INDEPENDENT (discretionary
+#     deep-stack shoving is a leak at any table size). The sharpest discriminator:
+#     every scripted archetype reads 0.0; only the v5 blueprint spews (~8).
+#
+# fold-to-c-bet is DELIBERATELY NOT gated in 6-max. Validation showed it does not
+# separate the classes: the tight scripted TAG over-folds (corrected 72-81%) while the
+# loose v5 blueprint sits at a near-GTO 33-50%, so any band that passes TAG would pass
+# v5 too. It is REPORTED as advisory via profile.fold_to_cbet_corrected_pct (the
+# production fold_to_cbet_pct is a ~14x undercount in 6-max — it drops ALL_IN c-bets and
+# every multiway facer — and must not be used). Revisit only with a solver-grounded
+# reference and far more facing-c-bet samples.
+BANDS_6MAX: Final[dict[str, tuple[float, float]]] = {
+    "vpip_pct": (15.0, 28.0),
+    "pfr_pct": (11.0, 22.0),
+    "noncommitted_all_in_preflop_pct": (0.0, 1.0),
+}
+
+
+def bands_for(table_size: int) -> dict[str, tuple[float, float]]:
+    """Behavioral bands appropriate to the table size (6-max is tighter than 3-max)."""
+    return dict(BANDS_6MAX if table_size >= 6 else BANDS)
+
 
 @dataclass(frozen=True)
 class MetricResult:
@@ -73,24 +106,43 @@ class BandResult:
         return tuple(m for m in self.metrics if not m.in_band)
 
 
-def _metric_values(profile: BehavioralProfile) -> Mapping[str, float]:
-    return {name: float(getattr(profile, name)) for name in BANDS}
+def _metric_values(profile: BehavioralProfile, bands: Mapping[str, tuple[float, float]]) -> Mapping[str, float]:
+    return {name: float(getattr(profile, name)) for name in bands}
 
 
-def evaluate_bands(profile: BehavioralProfile) -> BandResult:
-    """Evaluate a profile against the Stage-1 bands (PASS-iff-all)."""
-    values = _metric_values(profile)
+def evaluate_bands(
+    profile: BehavioralProfile,
+    bands: Mapping[str, tuple[float, float]] | None = None,
+) -> BandResult:
+    """Evaluate a profile against the Stage-1 bands (PASS-iff-all).
+
+    `bands` defaults to the 3-max `BANDS`; pass `bands_for(table_size)` (or
+    `BANDS_6MAX`) to gate a 6-max policy against the tighter, harness-calibrated bands.
+    """
+    active = BANDS if bands is None else bands
+    values = _metric_values(profile, active)
     return BandResult(
         metrics=tuple(
             MetricResult(name=name, value=values[name], low=lo, high=hi)
-            for name, (lo, hi) in BANDS.items()
+            for name, (lo, hi) in active.items()
         )
     )
 
 
-def band_score(profile: BehavioralProfile) -> float:
+def band_score(
+    profile: BehavioralProfile,
+    bands: Mapping[str, tuple[float, float]] | None = None,
+) -> float:
     """Total out-of-band distance for `profile` (lower = better; 0 = all in band)."""
-    return evaluate_bands(profile).score
+    return evaluate_bands(profile, bands).score
 
 
-__all__ = ["BANDS", "BandResult", "MetricResult", "band_score", "evaluate_bands"]
+__all__ = [
+    "BANDS",
+    "BANDS_6MAX",
+    "BandResult",
+    "MetricResult",
+    "band_score",
+    "bands_for",
+    "evaluate_bands",
+]
