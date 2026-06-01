@@ -137,9 +137,57 @@ class TagAgent(ScriptedAgent):
         return fold_or_check(legal)
 
 
+class LagAgent(ScriptedAgent):
+    """Loose-aggressive: enters many pots and APPLIES pressure — opens wide, 3-bets light,
+    c-bets and double-barrels relentlessly. Raises far more than it calls, and rarely just
+    flats. VPIP > 30%, PFR > 25%, AF > 3.
+
+    This is the opponent the NIT/TAG/STATION pool lacked: it PUNISHES loose-passive play —
+    it raises the hero's limps/calls (so loose entering must fold or commit) and barrels
+    into calling-stations (so never-folding gets value-bet and bluffed). The best-response
+    to a pool containing a LAG must therefore tighten (VPIP↓), fold to c-bets (fold-to-cbet↑)
+    and raise to avoid being run over (PFR↑) — i.e. tight-aggressive, not loose-passive.
+    """
+
+    archetype: ClassVar[Archetype] = Archetype.LAG
+
+    def _preflop(self, spot: AgentSpot, legal: list[AbstractAction]) -> AbstractAction:
+        r = preflop_rank(spot.hole)
+        if spot.to_call > 0:  # facing a raise
+            if r < 0.30:  # 3-bet a wide value+light range
+                return raise_or_shove(legal, _RERAISES)
+            if r < 0.42:  # flat (keeps PFR < VPIP — LAG band, not Maniac, not over-wide)
+                return call_action(legal)
+            return fold_or_check(legal)
+        # first-in — open wide and aggressively (never limp).
+        if r < 0.45:
+            return raise_or_shove(legal, _OPEN_RAISES)
+        return fold_or_check(legal)
+
+    def _postflop(self, spot: AgentSpot, legal: list[AbstractAction]) -> AbstractAction:
+        s = postflop_strength(spot.hole, spot.board)
+        if spot.to_call > 0:  # facing a bet — raise wide for value+pressure, call thin
+            if s >= 0.45:
+                return raise_or_shove(legal, _BETS)
+            if s >= 0.30:
+                return call_action(legal)
+            return fold_or_check(legal)
+        # checked to — c-bet/barrel almost everything (value AND air): the relentless
+        # aggression that makes the hero's loose calling -EV.
+        if s >= 0.18:
+            return raise_or_shove(legal, _BETS)
+        return fold_or_check(legal)
+
+
 def build_archetype_pool() -> list[ScriptedAgent]:
-    """The Stage-1 fine-tune opponent pool: real tight-passive players, no self-play."""
-    return [NitAgent(), TagAgent(), StationAgent()]
+    """The Stage-1 fine-tune opponent pool.
+
+    Includes a loose-AGGRESSIVE LAG (weighted up; STATION weighted down) so aggression
+    pressure outweighs the station's calling-reward — making loose-passive play net -EV, so
+    the best-response is tight-aggressive instead of collapsing to loose-calling (the
+    NIT/TAG/STATION-only pool's confirmed failure mode). The weighting (LAG ×2 here) is the
+    tuned knob; sampling is uniform over this list (finetune.py `_opponent_policy_for`)."""
+    return [NitAgent(), TagAgent(), StationAgent(), LagAgent(), LagAgent()]
 
 
-__all__ = ["NitAgent", "StationAgent", "TagAgent", "build_archetype_pool"]
+__all__ = ["LagAgent", "NitAgent", "StationAgent", "TagAgent", "build_archetype_pool"]

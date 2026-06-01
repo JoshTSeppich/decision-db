@@ -8,6 +8,7 @@ Component 1 SPR gate, so their short-stack play inherits the same all-in continu
 """
 
 from zoom.agents.archetypes import (
+    LagAgent,
     NitAgent,
     StationAgent,
     TagAgent,
@@ -17,6 +18,7 @@ from zoom.agents.base import AgentSpot, ScriptedAgent, postflop_strength, preflo
 
 __all__ = [
     "AgentSpot",
+    "LagAgent",
     "NitAgent",
     "ScriptedAgent",
     "StationAgent",

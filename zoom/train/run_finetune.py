@@ -70,9 +70,34 @@ class FineTuneArgs:
     # serial (see zoom.train.parallel_traversal); use it to cut per-iter wall-clock on
     # multi-core boxes. Future runs only — does not change results, only speed.
     num_workers: int = 1
+    # Diagnostic-only: when True the non-traverser seats are the bot's OWN current CFR
+    # strategy (pool=None self-play, the reference Deep CFR objective) instead of the
+    # fixed archetype pool. Used to answer "does plain self-play converge to a SOUND
+    # strategy in this abstraction?" — it does NOT change the Stage-1 fine-tune, whose
+    # default remains the archetype-pool best-response (self_play=False).
+    self_play: bool = False
+    # Diagnostic-only: export an intermediate best-response DB every `export_every` iters
+    # (to `<out_db stem>-iterNNNN.db`), so a single warm-started run yields the de-bias
+    # TRAJECTORY (nc-AI / VPIP vs iter) instead of only the endpoint — read each through
+    # the Stage-1 gate to see DIRECTION. 0 = off (default; no behavior change). The
+    # per-iter export reads the live reservoirs, exactly like the final export.
+    export_every: int = 0
 
 
 _CKPT_GLOB = "finetune_iter_*.pt"
+
+
+def _intermediate_db_url(out_db: str, t: int) -> str:
+    """Derive an intermediate sqlite URL `<stem>-iterNNNN.db` from the final --out-db.
+
+    `sqlite:///a/b/strategy.db` -> `sqlite:///a/b/strategy-iter0040.db`. Only the
+    sqlite scheme is supported here (the diagnostic export target); other schemes raise.
+    """
+    scheme, sep, rest = out_db.partition("://")
+    if not sep or scheme != "sqlite":
+        raise ValueError(f"--export-every needs a sqlite:// --out-db, got {out_db!r}")
+    p = Path(rest)
+    return f"sqlite://{p.with_name(p.stem + f'-iter{t:04d}' + p.suffix)}"
 
 
 def _ckpt_path(checkpoint_dir: Path, t: int) -> Path:
@@ -149,9 +174,8 @@ def run_finetune(args: FineTuneArgs) -> int:
         train_steps_per_iter=args.train_steps_per_iter,
         seed=args.seed,
     )
-    trainer = FineTuneTrainer(
-        cfg, game, pool=build_archetype_pool(), num_workers=args.num_workers
-    )
+    pool = None if args.self_play else build_archetype_pool()
+    trainer = FineTuneTrainer(cfg, game, pool=pool, num_workers=args.num_workers)
 
     # Resume from the latest mid-run checkpoint if one exists, else nets-only from
     # the blueprint. This is what makes an interrupted run survivable: a host reset
@@ -195,6 +219,15 @@ def run_finetune(args: FineTuneArgs) -> int:
         if args.checkpoint_dir is not None and t % args.checkpoint_every == 0:
             _save_resume_checkpoint(trainer, args.checkpoint_dir, t)
             _LOG.info("  checkpoint -> %s", _ckpt_path(args.checkpoint_dir, t))
+        if args.export_every > 0 and t % args.export_every == 0 and t < args.iters:
+            mid_url = _intermediate_db_url(args.out_db, t)
+            mid_db = open_db(mid_url)
+            mid_rows = export_best_response(
+                trainer.advantage_nets, trainer.advantage_reservoirs, mid_db,
+                version=args.strategy_version,
+            )
+            mid_db.close()
+            _LOG.info("  intermediate export (iter %d): %d rows -> %s", t, mid_rows, mid_url)
 
     # Save a FULL checkpoint INCLUDING the reservoir sidecar so this run's DB is fully
     # re-exportable later (the prior run saved nets-only, which is why its DB couldn't be
@@ -240,6 +273,12 @@ def build_args(argv: list[str] | None = None) -> FineTuneArgs:
         help="Component-1 ALL_IN gate: offer ALL_IN only when spr<=spr_cap (or forced jam). "
         "Lower drops deep-stack preflop shoves (tune to preflop ALL_IN<1%%).",
     )
+    p.add_argument(
+        "--self-play",
+        action="store_true",
+        help="DIAGNOSTIC: pool=None self-play (own CFR strategy on other seats) instead of "
+        "the archetype-pool best-response. Does NOT change the Stage-1 fine-tune default.",
+    )
     p.add_argument("--seed", type=int, default=2026)
     p.add_argument("--strategy-version", type=int, default=1)
     p.add_argument(
@@ -249,6 +288,13 @@ def build_args(argv: list[str] | None = None) -> FineTuneArgs:
         help="dir for mid-run resume checkpoints (use the persistent volume, e.g. /workspace/ckpts)",
     )
     p.add_argument("--checkpoint-every", type=int, default=20, help="save a resume checkpoint every N iters")
+    p.add_argument(
+        "--export-every",
+        type=int,
+        default=0,
+        help="DIAGNOSTIC: export an intermediate best-response DB to <out-db stem>-iterNNNN.db "
+        "every N iters, so one warm-started run yields the de-bias trajectory (0 = off).",
+    )
     p.add_argument(
         "--num-workers",
         type=int,
@@ -271,6 +317,8 @@ def build_args(argv: list[str] | None = None) -> FineTuneArgs:
         checkpoint_dir=a.checkpoint_dir,
         checkpoint_every=a.checkpoint_every,
         num_workers=a.num_workers,
+        self_play=a.self_play,
+        export_every=a.export_every,
     )
 
 

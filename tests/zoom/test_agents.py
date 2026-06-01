@@ -32,6 +32,7 @@ import pytest
 from zoom.abstraction_gate import legal_abstract_actions_gated
 from zoom.agents import (
     AgentSpot,
+    LagAgent,
     NitAgent,
     ScriptedAgent,
     StationAgent,
@@ -218,6 +219,16 @@ def test_station_full_signature_classifies_as_station() -> None:
     assert ArchetypeClassifier().classify(stats.as_opponent_stats) == Archetype.STATION
 
 
+def test_lag_full_signature_classifies_as_lag() -> None:
+    """The aggressive archetype the pool was missing: loose-aggressive, lands in the
+    classifier's LAG band (VPIP 26-40%, PFR 22-35%, AF > 2.5)."""
+    stats = _measure(LagAgent())
+    assert 0.26 <= stats.vpip <= 0.40, stats.vpip
+    assert 0.22 <= stats.pfr <= 0.35, stats.pfr
+    assert stats.af > 2.5, stats.af
+    assert ArchetypeClassifier().classify(stats.as_opponent_stats) == Archetype.LAG
+
+
 # ─────────── STATION: the two halves that define a station ───────────
 
 
@@ -334,10 +345,16 @@ def test_short_stack_premium_shoves_via_gate() -> None:
 # ─────────── pool + determinism ───────────
 
 
-def test_build_archetype_pool_has_three_distinct_archetypes() -> None:
+def test_build_archetype_pool_includes_weighted_aggressive_archetype() -> None:
+    from collections import Counter
+
     pool = build_archetype_pool()
     arches = {a.archetype for a in pool}
-    assert arches == {Archetype.NIT, Archetype.TAG, Archetype.STATION}
+    assert arches == {Archetype.NIT, Archetype.TAG, Archetype.STATION, Archetype.LAG}
+    # LAG weighted up; STATION (the passivity-reward) no heavier than LAG.
+    counts = Counter(type(a).__name__ for a in pool)
+    assert counts["LagAgent"] >= 2, counts
+    assert counts["StationAgent"] <= counts["LagAgent"], counts
 
 
 @pytest.mark.parametrize("agent", build_archetype_pool())
