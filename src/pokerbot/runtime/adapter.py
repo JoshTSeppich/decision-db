@@ -163,6 +163,7 @@ class RuntimeAdapter:
             pot=request.pot_committed,
             to_call=request.to_call,
             stack=hero_stack,
+            bb=request.blinds.bb,
         )
         emitted_amount = resolve_action(
             abstract, request.pot_committed, hero_stack, request.min_raise
@@ -396,7 +397,7 @@ def _sample_action_type(
 
 
 def _build_abstract_with_amount(
-    at: ActionType, *, pot: int, to_call: int, stack: int
+    at: ActionType, *, pot: int, to_call: int, stack: int, bb: int
 ) -> AbstractAction:
     if at == ActionType.FOLD:
         return AbstractAction(at, 0)
@@ -405,7 +406,12 @@ def _build_abstract_with_amount(
     if at == ActionType.ALL_IN:
         return AbstractAction(at, stack)
     if at in _RAISE_RATIO:
-        target = round(_RAISE_RATIO[at] * max(to_call, 1))
+        # Anchor on the prior raise-to amount when facing a bet, else the
+        # BB-equivalent open (to_call==0 — BB option / limped). Mirrors training
+        # `_legal_preflop` so a sampled unopened raise emits a sane 2.5x/3.5x BB
+        # open instead of a degenerate ~1-chip size both clamp to the same floor.
+        anchor = to_call if to_call > 0 else max(bb, 1)
+        target = round(_RAISE_RATIO[at] * anchor)
         return AbstractAction(at, target)
     frac = _BET_FRAC[at]
     target = to_call + round(frac * pot)

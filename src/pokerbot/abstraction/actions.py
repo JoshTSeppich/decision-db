@@ -80,7 +80,7 @@ def legal_abstract_actions(
     pot: int,
     to_call: int,
     stack: int,
-    min_raise: int,  # noqa: ARG001  reserved for step 6 (resolve_action uses it)
+    min_raise: int,  # BB-equivalent open anchor for unopened preflop (to_call==0)
     street: Street,
 ) -> list[AbstractAction]:
     """Abstract actions available for the current player.
@@ -94,20 +94,23 @@ def legal_abstract_actions(
         raise ValueError(f"pot/to_call/stack must be non-negative: {pot=} {to_call=} {stack=}")
 
     if street == "preflop":
-        return _legal_preflop(to_call, stack)
+        return _legal_preflop(to_call, stack, min_raise)
     return _legal_postflop(pot, to_call, stack)
 
 
-def _legal_preflop(to_call: int, stack: int) -> list[AbstractAction]:
+def _legal_preflop(to_call: int, stack: int, min_raise: int) -> list[AbstractAction]:
     actions: list[AbstractAction] = []
     if to_call > 0:
         actions.append(AbstractAction(ActionType.FOLD, 0))
     actions.append(AbstractAction(ActionType.CHECK_CALL, min(to_call, stack)))
-    # The "previous raise" anchor for first-raise vs 3-bet+ is approximated by
-    # `to_call` — BB when no one has raised yet, the prior raise-to amount when
-    # someone has. Step 6 may refine using explicit raise-history.
+    # Open-size anchor: the prior raise-to amount when facing a bet (to_call),
+    # else the BB-equivalent min-open (`min_raise`) so an UNOPENED pot
+    # (to_call==0 — BB option / limped) still offers a non-shove raise rather
+    # than collapsing to ALL_IN as the only aggression. Reuses the existing
+    # RAISE_2_5X/RAISE_3_5X indices — no new ActionType, action space unchanged.
+    anchor = to_call if to_call > 0 else min_raise
     for at, ratio in PREFLOP_RAISE_RATIOS:
-        target = round(ratio * to_call) if to_call > 0 else 0
+        target = round(ratio * anchor)
         if 0 < target < stack:
             actions.append(AbstractAction(at, target))
     if stack > 0:
