@@ -31,7 +31,8 @@ from typing import TYPE_CHECKING, Final, cast
 from pokerbot.abstraction import ActionType, parse_card
 from pokerbot.abstraction.actions import legal_abstract_actions
 from pokerbot.abstraction.encoding import effective_stack, position_from_seats
-from pokerbot.runtime.adapter import _build_history_bytes
+from pokerbot.runtime.adapter import _build_history_bytes, _folded_seats
+from pokerbot.runtime.default_policy import default_policy_action
 from zoom.abstraction_gate import DEFAULT_SPR_CAP, effective_spr
 
 # Reuse the production profiler read-only. It lives in scripts/, which the project
@@ -183,8 +184,17 @@ def _spot_from_request(request: GameStateRequest) -> AgentSpot:
     street = _STREETS[_BOARD_LEN_TO_STREET_IDX[len(request.board)]]
     position = position_from_seats(request.button_seat, seat, request.table_size)
     # Effective stack = min(hero, max remaining opp), matching how the export keys rows
-    # (nlhe_game.py:388). Without this the chip leader buckets by its raw stack and misses.
-    opps = [request.stacks[s] for s in range(request.table_size) if s != seat and request.stacks[s] > 0]
+    # (nlhe_game.py:383-388, which uses pokerkit `statuses` → folded seats excluded) and
+    # the production adapter (`_stack_bucket`, adapter.py:217 → `seat not in folded`).
+    # FOLDED seats must be excluded: a folded player keeps its full (uncommitted) stack,
+    # so including it makes a folded-to-button spot bucket by ~100bb (sb6) instead of the
+    # blinds-relative ~99bb (sb5) the DB was keyed at → systematic lookup MISS at BTN.
+    folded = _folded_seats(request)
+    opps = [
+        request.stacks[s]
+        for s in range(request.table_size)
+        if s != seat and s not in folded and request.stacks[s] > 0
+    ]
     eff = effective_stack(request.stacks[seat], opps)
     # Real §C betting history via the SAME encoder production uses (adapter._build_history_bytes),
     # so the DB lookup tries the exact history-aware row first, exactly like the deployed
@@ -228,7 +238,15 @@ class _SpotPolicyAdapter:
         self.fold_to_cbet: set[tuple[int, int]] = set()
 
     def decide(self, request: GameStateRequest) -> _Response:
-        chosen = self._sample(self._policy(_spot_from_request(request)))
+        dist = self._policy(_spot_from_request(request))
+        if any(p > 0 for p in dist.values()):
+            chosen = self._sample(dist)
+        else:
+            # DB MISS (empty dist): mirror the production RuntimeAdapter, which routes an
+            # unknown spot through `default_policy_action` (hand-strength aware: folds weak
+            # hands) rather than a blind CHECK_CALL. A blind CHECK_CALL miscounts every
+            # miss as VPIP — the artifact that inflated BTN VPIP to ~100%.
+            chosen = self._default_action(request)
         if len(request.board) == 0 and chosen == ActionType.ALL_IN:
             key = (self.current_hand, request.hero_seat)
             self.preflop_shoves.add(key)
@@ -259,6 +277,26 @@ class _SpotPolicyAdapter:
         self.facing_cbet.add(key)
         if chosen == ActionType.FOLD:
             self.fold_to_cbet.add(key)
+
+    def _default_action(self, request: GameStateRequest) -> ActionType:
+        """Production's miss-handler: a single hand-strength-aware action from
+        `default_policy_action`, the SAME fallback the deployed RuntimeAdapter uses
+        when a spot has no DB row (adapter.py:143). Keeps the gate faithful to
+        production on coverage misses instead of fabricating a VPIP-counting call."""
+        hole = (parse_card(request.hero_hole[0]), parse_card(request.hero_hole[1]))
+        board = tuple(parse_card(c) for c in request.board)
+        street = _STREETS[_BOARD_LEN_TO_STREET_IDX[len(request.board)]]
+        position = position_from_seats(request.button_seat, request.hero_seat, request.table_size)
+        return default_policy_action(
+            hole,
+            board,
+            street,  # type: ignore[arg-type]
+            table_size=request.table_size,
+            position=position,
+            pot=request.pot_committed,
+            to_call=request.to_call,
+            stack=request.stacks[request.hero_seat],
+        ).type
 
     def _sample(self, dist: Mapping[ActionType, float]) -> ActionType:
         items = [(a, p) for a, p in dist.items() if p > 0]
