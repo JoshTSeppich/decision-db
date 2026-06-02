@@ -248,6 +248,10 @@ drop. The client should reconnect with exponential backoff.
 
 ### G.1 Preflop, hero UTG, facing BB only, 100bb stacks, 8-max
 
+> `stacks` are CHIPS-BEHIND: the SB (seat 1) and BB (seat 2) blinds are deducted
+> from their stacks (995 / 990) and held in `current_bets`. This matches the
+> training convention (`pk.stacks`); do NOT report gross stacks. See §H.5.
+
 Request:
 ```json
 {
@@ -262,7 +266,7 @@ Request:
     "button_seat": 0,
     "hero_hole": ["As", "Kh"],
     "board": [],
-    "stacks": [1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000],
+    "stacks": [1000, 995, 990, 1000, 1000, 1000, 1000, 1000],
     "current_bets": [0, 5, 10, 0, 0, 0, 0, 0],
     "pot_committed": 15,
     "to_call": 10,
@@ -355,16 +359,34 @@ is the expected baseline here.
 
 ## H. Table-Size Routing and Calibration
 
-The `DualStrategyDB` router selects the policy DB by `table_size`:
+**Competition target is 6-max.** The live zoom advisory service is wired as a
+PURE-6-max single DB: `--db training/v5-6max-fix.db` (the de-biased v5-6max RNR
+blueprint, `table_size=6` rows only), **no `--db-9max`**. With the secondary
+omitted, `build_zoom_adapter` uses the single-DB path (`db = primary`), so a
+`table_size=6` request keys directly into the blueprint — no `DualStrategyDB`
+routing. See `scripts/serve_6max_blueprint.sh`. `table_size` is pass-through from
+the eyes (never hardcoded).
+
+If a `--db-9max` secondary IS supplied (for serving non-6 sizes), the
+`DualStrategyDB` router selects the policy DB by `table_size`:
 
 | `table_size` | Routes to | DB training distribution |
 |---|---|---|
-| `6` | `--db` (e.g. `strategy-pilot-v2.db`) | 6-max trained (only `table_size=6` rows present) |
-| `2, 3, 4, 5, 7, 8, 9` | `--db-9max` (e.g. `strategy-pilot-v3-9max.db`) | 9-max trained (only `table_size=9` rows present) |
+| `6` | `--db` (the v5-6max blueprint) | 6-max trained (only `table_size=6` rows present) |
+| `2, 3, 4, 5, 7, 8, 9` | `--db-9max` (e.g. a 9-max DB) | 9-max trained (only `table_size=9` rows present) |
 
-The server **accepts every `table_size ∈ {2..9}` with no error**.
+The server **accepts every `table_size ∈ {2..9}` with no error** (so a non-6
+request against the pure-6-max wiring returns `default_policy`, NOT an error).
 
-### H.1 Empirical coverage (measured 2026-05-20)
+### H.1 Empirical coverage (measured 2026-05-20, PILOT DBs)
+
+> NOTE: this table was measured against the PILOT DBs (`strategy-pilot-v2` +
+> `strategy-pilot-v3-9max`), not the live v5-6max blueprint. It documents the
+> `table_size`-routing behaviour (only `{6, 9}` hit), which is unchanged. The
+> 6-max row applies to the blueprint too, with one caveat now tracked
+> separately: a 100bb effective stack rounds to `stack_bucket=6`, which is
+> near-empty at canonical preflop cells, so 100bb spots hit ONLY if the eyes
+> report chips-behind (post-blind) stacks → `stack_bucket=5`. See §H.5.
 
 `StrategyDB.nearest_neighbor` requires an EXACT `table_size` match in
 SQL (`strategy_db/sqlite.py:78`). The trained DBs contain only
@@ -436,6 +458,48 @@ The live competition table fluctuates as players sit, leave, or are
 reseated. Send the CURRENT `table_size` (count of non-folded,
 non-sitting-out players) on every request. The router reselects the DB
 per call; no session state required.
+
+### H.5 100bb effective-stack boundary (LIVE — confirm before trusting 6-max)
+
+`stack_bucket` boundaries are `(10,20,30,50,75,100,150,200,300)` BB, binned by
+`eff_bb < boundary` (`abstraction/encoding.py:70-75`). So an effective stack of
+**exactly 100bb → `stack_bucket=6`**, whereas **99bb → `stack_bucket=5`**.
+
+There are THREE conventions in play, and two of them are verified to CONFLICT:
+
+- **Training (VERIFIED — chips-behind).** The export keys `stack_bucket` off
+  pokerkit `pk.stacks` (`nlhe_game.py:381-386`), which holds chips BEHIND —
+  posted blinds and the current bet have already left the stack (confirmed by
+  `pot = sum(initial_stacks) − sum(pk.stacks)`, `nlhe_game.py:267`). So at a
+  100bb table the BB's effective stack at the first decision is ~99bb →
+  `stack_bucket=5`. The v5-6max blueprint trained the canonical preflop spots
+  there: measured coverage in `training/v5-6max-fix.db` at the AKo preflop
+  SB-relative cell has `stack_bucket` 0-5 populated, **bucket 6 absent**
+  (overall preflop: 18,644 rows at bucket 5 vs only 1,307 at bucket 6).
+- **Contract example G.1 (VERIFIED — gross; WRONG, contradicts training).** §G.1
+  shows the BB with `stacks=1000` and `current_bets=10` — the blind is in
+  `current_bets`, NOT deducted from `stacks`. That is GROSS, the opposite of the
+  chips-behind convention training used. Fed verbatim it gives 100bb →
+  `stack_bucket=6` → the near-empty bucket → `default_policy` MISS. **G.1 has
+  been corrected below (BB now shows `stacks=990`) so the contract stops
+  demonstrating the wrong convention.**
+- **Adapter (VERIFIED — consumes `request.stacks` raw).** `_stack_bucket`
+  computes `min(hero, max-remaining-opp) // bb` from `request.stacks` directly
+  and **never references `current_bets`** (`adapter.py:213-224`). It therefore
+  assumes the caller already sent chips-behind (to match training); it does NOT
+  normalize gross→behind.
+
+**The ONLY remaining unknown is which convention the EYES actually emit** — that
+is not observable from this repo (no eyes source / captured frames). Resolve by
+capturing ONE real `GameStateRequest` at a known 100bb 6-max preflop spot and
+checking a committed seat (e.g. the BB): `stacks[seat] == starting`
+(GROSS — adapter mis-buckets to 6, MISS) vs `stacks[seat] == starting −
+current_bets[seat]` (chips-behind — hits bucket 5). If the eyes are gross, the
+fix is `chips-behind = stacks − current_bets` (a field the eyes already send),
+normalized in the zoom bridge before `adapter.decide` — gated on this
+confirmation, since applying it when the eyes already report chips-behind would
+double-subtract. Same keying-seam class as the `to_call==0` and folded-seats
+bugs: align the stack convention, do not guess.
 
 ---
 

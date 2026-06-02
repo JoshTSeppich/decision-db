@@ -1,4 +1,4 @@
-"""Stateful WebSocket advisory server for 3-handed zoom (layer L5 skeleton).
+"""Stateful WebSocket advisory server for 6-max zoom (layer L5 skeleton).
 
 Runs ALONGSIDE the frozen brain (`scripts/serve.py`) — it does not import or
 modify it. It reuses the frozen brain's `GameStateRequest` envelope and wraps it
@@ -15,10 +15,11 @@ Wire format (one JSON message in, one out):
 The blueprint action is the frozen DB policy (read-only); the L4 subgame solver
 will replace that call inside `ZoomExploiterService.advise`.
 
-Run:
+Run (6-max competition target — single 6-max blueprint, no 9-max secondary):
     python scripts/serve_zoom.py --port 8766 \\
-        --db strategy-pilot-v2.db --db-9max strategy-pilot-v3-9max.db \\
+        --db training/v5-6max-fix.db \\
         --abstraction-path abstraction
+    # or use the committed wrapper: bash scripts/serve_6max_blueprint.sh
 """
 
 from __future__ import annotations
@@ -78,8 +79,11 @@ def build_zoom_adapter(
     rng_seed: int | None,
 ) -> tuple[RuntimeAdapter, StrategyDB]:
     """Boot the read-only blueprint adapter. Mirrors `serve.build_adapter`'s
-    single/dual routing (3-max infosets route to the 9-max DB under DualStrategyDB)
-    without importing the frozen serve.py."""
+    single/dual routing without importing the frozen serve.py. For the 6-max
+    competition target, pass only `--db` (the v5-6max blueprint): with
+    `db_path_9max=None` this uses the single-DB path (`db = primary`), so
+    table_size=6 keys directly into it. A `--db-9max` is only needed if non-6
+    table sizes must be served (they route to the 9-max DB under DualStrategyDB)."""
     abstraction = AbstractionTables(path=abstraction_path)
     primary = open_db(_to_db_url(db_path))
     db: StrategyDB

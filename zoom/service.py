@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 
 
 class ZoomExploiterService:
-    """Stateful advisory brain for 3-handed zoom.
+    """Stateful advisory brain for 6-max zoom.
 
     State lives per re-identified `opponent_id`:
       * the Dirichlet opponent model persists ACROSS hands (it learns each
