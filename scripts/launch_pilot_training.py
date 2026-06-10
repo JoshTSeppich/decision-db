@@ -189,6 +189,18 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable in-loop LBR exploitability eval (use in CI smoke tests)",
     )
+    p.add_argument(
+        "--lbr-every",
+        type=int,
+        default=DeepCFRConfig().lbr_every,
+        help=(
+            "Run in-loop LBR exploitability eval every N outer iters (default %d). "
+            "Exact LBR enumerates all players' trees; on 6-max NLHE each occurrence "
+            "costs minutes, so set this large (e.g. 500) for scaled runs to keep "
+            "periodic exploitability without dominating wall-clock. Ignored if "
+            "--skip-lbr is set." % DeepCFRConfig().lbr_every
+        ),
+    )
     return p
 
 
@@ -232,7 +244,7 @@ def main() -> int:
         advantage_buffer_size=args.advantage_buffer_size,
         policy_buffer_size=args.policy_buffer_size,
         checkpoint_every=args.checkpoint_every,
-        lbr_every=0 if args.skip_lbr else DeepCFRConfig().lbr_every,
+        lbr_every=0 if args.skip_lbr else args.lbr_every,
         coverage_instrument=args.coverage_instrument,  # opp_aggression_bias left at default 0.0
         seed=args.seed,
     )
