@@ -141,6 +141,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--checkpoint-every", type=int, default=25)
     p.add_argument(
+        "--coverage-instrument",
+        action="store_true",
+        help=(
+            "Piece 2: accumulate per-(street x facing-bet) infoset visit counters "
+            "and log single-visit fraction + visit-depth histogram at each checkpoint. "
+            "opp_aggression_bias is left at its 0.0 default (plain external-sampling MCCFR)."
+        ),
+    )
+    p.add_argument(
         "--table-size",
         type=int,
         default=6,
@@ -213,6 +222,7 @@ def main() -> int:
         policy_buffer_size=args.policy_buffer_size,
         checkpoint_every=args.checkpoint_every,
         lbr_every=0 if args.skip_lbr else DeepCFRConfig().lbr_every,
+        coverage_instrument=args.coverage_instrument,  # opp_aggression_bias left at default 0.0
         seed=args.seed,
     )
     log.info("config: %s", config)
