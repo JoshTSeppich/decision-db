@@ -37,6 +37,8 @@ from pokerbot.training.export import (
 )
 from pokerbot.training.lbr import local_best_response, make_advantage_strategy_fn
 from pokerbot.training.nets import AdvantageNet, PolicyNet
+from pokerbot.training.parallel import cfr_iteration as parallel_cfr_iteration
+from pokerbot.training.parallel import make_worker_pool
 from pokerbot.training.traversal import Reservoir, TraversalStats, external_sampling_traversal
 
 _LOG = logging.getLogger("pokerbot.training")
@@ -56,10 +58,20 @@ class Trainer:
         *,
         device: str = "cpu",
         run_metadata: dict[str, Any] | None = None,
+        num_workers: int = 0,
     ) -> None:
         self.config = config
         self.game = game
         self.device = torch.device(device)
+        # num_workers == 0  → legacy single-RNG serial loop (`_cfr_iteration`),
+        #                      byte-identical to before this knob existed (default).
+        # num_workers >= 1  → fan-out/merge engine (`_cfr_iteration_parallel`):
+        #                      per-traversal RNG + single merge RNG. 1 runs the
+        #                      engine in-process (the serial *reference*); >1 fans
+        #                      out across a spawn pool. Both are bit-identical
+        #                      (tests/test_deepcfr_parallel.py).
+        self.num_workers = num_workers
+        self._worker_pool: Any | None = None
         # Free-form provenance saved into checkpoint metadata alongside `config`
         # (e.g. lru_max, which lives in the abstraction layer and isn't part of
         # DeepCFRConfig). None is stored as-is for checkpoints predating this.
@@ -98,41 +110,48 @@ class Trainer:
             self.load_checkpoint(resume_from)
             _LOG.info("resumed from %s at iter=%d", resume_from, self.iter)
         run_t0 = time.perf_counter()
-        for t in range(self.iter + 1, self.config.outer_iters + 1):
-            self.iter = t
-            iter_t0 = time.perf_counter()
-            self._cfr_iteration(t)
-            trav_dt = time.perf_counter() - iter_t0
-            train_t0 = time.perf_counter()
-            self._train_advantage_nets(t)
-            train_dt = time.perf_counter() - train_t0
+        try:
+            for t in range(self.iter + 1, self.config.outer_iters + 1):
+                self.iter = t
+                iter_t0 = time.perf_counter()
+                if self.num_workers >= 1:
+                    self._cfr_iteration_parallel(t)
+                else:
+                    self._cfr_iteration(t)
+                trav_dt = time.perf_counter() - iter_t0
+                train_t0 = time.perf_counter()
+                self._train_advantage_nets(t)
+                train_dt = time.perf_counter() - train_t0
+                _LOG.info(
+                    "[iter %d/%d] %.1fs trav + %.1fs train (adv_buf=%d, policy_buf=%d, "
+                    "wall=%.1fmin, eta=%.1fmin)",
+                    t,
+                    self.config.outer_iters,
+                    trav_dt,
+                    train_dt,
+                    sum(len(r) for r in self.advantage_reservoirs),
+                    len(self.policy_reservoir),
+                    (time.perf_counter() - run_t0) / 60.0,
+                    (self.config.outer_iters - t) * (time.perf_counter() - run_t0) / max(t, 1) / 60.0,
+                )
+                if self.config.lbr_every > 0 and t % self.config.lbr_every == 0:
+                    self._log_lbr(t)
+                if t % self.config.checkpoint_every == 0:
+                    self.save_checkpoint(output_dir / f"iter_{t:04d}.pt")
+                    _LOG.info("[iter %d] checkpoint -> iter_%04d.pt", t, t)
+                    self._log_per_street_unique_counts()
+                    self._log_region_visit_depth()
+            _LOG.info("training advantage phase done; entering policy-net training")
+            policy_t0 = time.perf_counter()
+            self._train_policy_net()
+            _LOG.info("policy-net training done in %.1fs", time.perf_counter() - policy_t0)
             _LOG.info(
-                "[iter %d/%d] %.1fs trav + %.1fs train (adv_buf=%d, policy_buf=%d, "
-                "wall=%.1fmin, eta=%.1fmin)",
-                t,
-                self.config.outer_iters,
-                trav_dt,
-                train_dt,
-                sum(len(r) for r in self.advantage_reservoirs),
-                len(self.policy_reservoir),
+                "TRAINING COMPLETE — total wall-clock %.2f min",
                 (time.perf_counter() - run_t0) / 60.0,
-                (self.config.outer_iters - t) * (time.perf_counter() - run_t0) / max(t, 1) / 60.0,
             )
-            if self.config.lbr_every > 0 and t % self.config.lbr_every == 0:
-                self._log_lbr(t)
-            if t % self.config.checkpoint_every == 0:
-                self.save_checkpoint(output_dir / f"iter_{t:04d}.pt")
-                _LOG.info("[iter %d] checkpoint -> iter_%04d.pt", t, t)
-                self._log_per_street_unique_counts()
-                self._log_region_visit_depth()
-        _LOG.info("training advantage phase done; entering policy-net training")
-        policy_t0 = time.perf_counter()
-        self._train_policy_net()
-        _LOG.info("policy-net training done in %.1fs", time.perf_counter() - policy_t0)
-        _LOG.info(
-            "TRAINING COMPLETE — total wall-clock %.2f min",
-            (time.perf_counter() - run_t0) / 60.0,
-        )
+        finally:
+            # Spawn pool must never outlive the run (idle workers = idle-bleed).
+            self.close_pool()
 
     def export_strategy(
         self,
@@ -165,6 +184,41 @@ class Trainer:
                 stats=self._cov_stats,
                 opp_aggression_bias=self.config.opp_aggression_bias,
             )
+
+    def _cfr_iteration_parallel(self, t: int) -> None:
+        """Fan-out/merge traversal phase (num_workers >= 1).
+
+        Delegates to the bit-identical engine in ``pokerbot.training.parallel``.
+        ``num_workers == 1`` runs in-process (the serial reference); ``> 1`` lazily
+        spins up a spawn pool. The merge folds both the reservoir samples and the
+        per-(street × facing-bet) coverage counters back in, so the parallel run
+        reproduces the single-process reservoirs and visit-depth readout exactly.
+        """
+        if self.num_workers > 1 and self._worker_pool is None:
+            self._worker_pool = make_worker_pool(
+                self.num_workers, self.game, self.advantage_nets
+            )
+        parallel_cfr_iteration(
+            game=self.game,
+            nets=self.advantage_nets,
+            advantage_reservoirs=self.advantage_reservoirs,
+            policy_reservoir=self.policy_reservoir,
+            iter_t=t,
+            traversals_per_iter=self.config.traversals_per_iter,
+            master_seed=self.config.seed,
+            num_workers=self.num_workers,
+            opp_aggression_bias=self.config.opp_aggression_bias,
+            coverage=self._cov_stats is not None,
+            cov_stats=self._cov_stats,
+            worker_pool=self._worker_pool,
+        )
+
+    def close_pool(self) -> None:
+        """Tear down the worker pool if one was started. Idempotent."""
+        if self._worker_pool is not None:
+            self._worker_pool.close()
+            self._worker_pool.join()
+            self._worker_pool = None
 
     # ───────── diagnostics ─────────
 

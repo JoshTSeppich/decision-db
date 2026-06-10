@@ -150,6 +150,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--num-workers",
+        type=int,
+        default=0,
+        help=(
+            "Traversal-phase parallelism. 0 = legacy single-process serial loop "
+            "(default, byte-identical to pre-port). >=1 = fan-out/merge engine "
+            "(bit-identical 1-worker vs N-worker; see tests/test_deepcfr_parallel.py). "
+            "Set near vCPU count for the scaled cloud run."
+        ),
+    )
+    p.add_argument(
         "--table-size",
         type=int,
         default=6,
@@ -236,7 +247,7 @@ def main() -> int:
         "advantage_buffer_size": args.advantage_buffer_size,
         "policy_buffer_size": args.policy_buffer_size,
     }
-    trainer = Trainer(config, game, run_metadata=run_metadata)
+    trainer = Trainer(config, game, run_metadata=run_metadata, num_workers=args.num_workers)
 
     args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
     resume_from = Path(args.resume) if args.resume else None
