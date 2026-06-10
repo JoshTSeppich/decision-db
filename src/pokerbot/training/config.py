@@ -58,6 +58,22 @@ class DeepCFRConfig:
     # actually enumerates.
     lbr_samples: int = 1
 
+    # ── retrain-mechanisms spike (DEFAULT-OFF; default path is unchanged) ──
+    # Piece 1: opponent-node aggression bias. 0.0 = pure on-policy sampling
+    # (current behavior, byte-identical). >0 mixes the opponent's sampling
+    # distribution toward bet/raise actions: sample ~ (1-b)*on_policy +
+    # b*uniform(aggressive). Only the SAMPLED action changes — the recorded
+    # policy-net target stays the true on-policy strategy. NOTE: with b>0 the
+    # external-sampling regret estimator is biased (no importance-sampling
+    # correction); this knob is an exploration/visitation lever, NOT a
+    # correctness-preserving change. See the spike report.
+    opp_aggression_bias: float = 0.0
+    # Piece 2: per-(street × facing-aggression) visit-depth instrumentation.
+    # False = no counter, no extra logging (unchanged). True = the trainer
+    # accumulates a per-region infoset visit counter and logs single-visit
+    # fraction + a depth histogram at each checkpoint.
+    coverage_instrument: bool = False
+
 
 @dataclass(frozen=True)
 class EvalResult:

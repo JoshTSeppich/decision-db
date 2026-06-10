@@ -37,7 +37,7 @@ from pokerbot.training.export import (
 )
 from pokerbot.training.lbr import local_best_response, make_advantage_strategy_fn
 from pokerbot.training.nets import AdvantageNet, PolicyNet
-from pokerbot.training.traversal import Reservoir, external_sampling_traversal
+from pokerbot.training.traversal import Reservoir, TraversalStats, external_sampling_traversal
 
 _LOG = logging.getLogger("pokerbot.training")
 
@@ -83,6 +83,11 @@ class Trainer:
         )
         self.rng = random.Random(config.seed)
         self.iter = 0
+        # Piece 2: per-(street × facing-bet) visit counter, accumulated since the
+        # last checkpoint. None when instrumentation is off → zero overhead.
+        self._cov_stats: TraversalStats | None = (
+            TraversalStats() if config.coverage_instrument else None
+        )
 
     # ───────── public API ─────────
 
@@ -119,6 +124,7 @@ class Trainer:
                 self.save_checkpoint(output_dir / f"iter_{t:04d}.pt")
                 _LOG.info("[iter %d] checkpoint -> iter_%04d.pt", t, t)
                 self._log_per_street_unique_counts()
+                self._log_region_visit_depth()
         _LOG.info("training advantage phase done; entering policy-net training")
         policy_t0 = time.perf_counter()
         self._train_policy_net()
@@ -156,6 +162,8 @@ class Trainer:
                 policy_reservoir=self.policy_reservoir,
                 iter_t=t,
                 rng=self.rng,
+                stats=self._cov_stats,
+                opp_aggression_bias=self.config.opp_aggression_bias,
             )
 
     # ───────── diagnostics ─────────
@@ -227,6 +235,43 @@ class Trainer:
             self.policy_reservoir.size,
             self.policy_reservoir.capacity,
         )
+
+    def _log_region_visit_depth(self) -> None:
+        """Log per-(street × facing-bet) infoset visit depth (Piece 2).
+
+        Cumulative since training start. For each region: distinct infosets, total
+        visits, single-visit fraction, and a depth histogram — so the THIN regions
+        (facing-aggression, late streets) are visible, not hidden in the average.
+        No-op unless `coverage_instrument` is on.
+        """
+        if self._cov_stats is None or not self._cov_stats.region_visits:
+            return
+        names = ("preflop", "flop", "turn", "river")
+        for street, facing in sorted(self._cov_stats.region_visits):
+            ctr = self._cov_stats.region_visits[(street, facing)]
+            distinct = len(ctr)
+            if distinct == 0:
+                continue
+            total = sum(ctr.values())
+            singles = sum(1 for c in ctr.values() if c == 1)
+            d2 = sum(1 for c in ctr.values() if c == 2)
+            d3_5 = sum(1 for c in ctr.values() if 3 <= c <= 5)
+            d6 = sum(1 for c in ctr.values() if c >= 6)
+            role = "facing-bet" if facing else "not-facing"
+            _LOG.info(
+                "  visit-depth %-7s %-10s: infosets=%d visits=%d single-visit=%.0f%% "
+                "depth[1=%d 2=%d 3-5=%d 6+=%d max=%d]",
+                names[street],
+                role,
+                distinct,
+                total,
+                100.0 * singles / distinct,
+                singles,
+                d2,
+                d3_5,
+                d6,
+                max(ctr.values()),
+            )
 
     # ───────── network training ─────────
 

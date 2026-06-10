@@ -2,12 +2,30 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from typing import TYPE_CHECKING, Any, TypeVar
 
 import numpy as np
 import torch
 
+from pokerbot.abstraction.actions import ActionType
 from pokerbot.training.nets import regret_match
+
+# Aggressive actions for the opponent-aggression-bias knob (Piece 1). Reconstructed
+# from the public enum (mirrors actions._BET_LIKE_TYPES) so we don't reach into a
+# private. IntEnum members compare/hash equal to their int, so membership tests
+# against the int action indices in `legal_actions` work directly.
+_AGGRESSIVE_ACTIONS: frozenset[int] = frozenset(
+    {
+        int(ActionType.BET_33),
+        int(ActionType.BET_66),
+        int(ActionType.BET_100),
+        int(ActionType.BET_150),
+        int(ActionType.ALL_IN),
+        int(ActionType.RAISE_2_5X),
+        int(ActionType.RAISE_3_5X),
+    }
+)
 
 if TYPE_CHECKING:
     import random
@@ -166,12 +184,49 @@ class Reservoir:
 
 
 class TraversalStats:
-    """Lightweight counter so tests can verify sample counts."""
+    """Lightweight counter so tests can verify sample counts.
+
+    When coverage instrumentation is on (Piece 2), also accumulates a per-region
+    infoset visit counter: region_visits[(street, facing_bet)] is a Counter over
+    infoset keys, so we can report single-visit fraction + visit-depth broken down
+    by street AND aggressor role (facing_bet = FOLD is legal at this node).
+    """
 
     def __init__(self) -> None:
         self.advantage_samples: int = 0
         self.policy_samples: int = 0
         self.terminal_visits: int = 0
+        self.region_visits: dict[tuple[int, int], Counter[bytes]] = {}
+
+    def record_visit(self, street: int, facing_bet: int, infoset_key: bytes) -> None:
+        region = self.region_visits.get((street, facing_bet))
+        if region is None:
+            region = Counter()
+            self.region_visits[(street, facing_bet)] = region
+        region[infoset_key] += 1
+
+    def reset_region_visits(self) -> None:
+        self.region_visits = {}
+
+
+def _aggression_biased_weights(
+    legal_list: list[int], on_policy: list[float], bias: float
+) -> list[float]:
+    """Mixture sampling weights: (1-bias)*on_policy + bias*uniform(aggressive).
+
+    bias==0 returns `on_policy` unchanged (callers guard on bias>0 anyway). If no
+    aggressive action is legal at this node, the aggressive mass falls back onto
+    the on-policy distribution so the result is still a valid weight vector.
+    """
+    total = sum(on_policy)
+    base = [p / total for p in on_policy] if total > 0 else [1.0 / len(legal_list)] * len(legal_list)
+    aggressive_idx = [i for i, a in enumerate(legal_list) if a in _AGGRESSIVE_ACTIONS]
+    if not aggressive_idx:
+        return base  # nothing aggressive to bias toward (e.g. fold/check-only node)
+    agg = [0.0] * len(legal_list)
+    for i in aggressive_idx:
+        agg[i] = 1.0 / len(aggressive_idx)
+    return [(1.0 - bias) * base[i] + bias * agg[i] for i in range(len(legal_list))]
 
 
 def external_sampling_traversal(
@@ -184,6 +239,7 @@ def external_sampling_traversal(
     iter_t: int,
     rng: random.Random,
     stats: TraversalStats | None = None,
+    opp_aggression_bias: float = 0.0,
 ) -> float:
     """One external-sampling MCCFR traversal.
 
@@ -204,6 +260,15 @@ def external_sampling_traversal(
     if mask.sum().item() == 0:
         raise RuntimeError(f"no legal actions at infoset {game.infoset_key(state)!r}")
 
+    # Coverage instrumentation (Piece 2): record this decision node's visit,
+    # keyed by (street, facing_bet). The infoset key is InfoSet.to_bytes() whose
+    # byte 1 is the street (spec §C); facing_bet = FOLD (action 0) is legal here.
+    if stats is not None:
+        key = game.infoset_key(state)
+        street = key[1] if len(key) > 1 and key[1] < 4 else 0
+        facing_bet = 1 if mask_tuple[ActionType.FOLD] else 0
+        stats.record_visit(street, facing_bet, key)
+
     with torch.no_grad():
         advantages = advantage_nets[actor](features.unsqueeze(0)).squeeze(0)
     strategy = regret_match(advantages.unsqueeze(0), mask.unsqueeze(0)).squeeze(0)
@@ -223,6 +288,7 @@ def external_sampling_traversal(
                 iter_t,
                 rng,
                 stats,
+                opp_aggression_bias,
             )
         expected = (strategy * action_values).sum().item()
         # Counterfactual regret = (action_value - expected) for legal actions only.
@@ -238,7 +304,15 @@ def external_sampling_traversal(
     legal_list = list(game.legal_actions(state))
     probs = [float(strategy[a].item()) for a in legal_list]
     total = sum(probs)
-    if total <= 0:
+    if opp_aggression_bias > 0.0:
+        # Piece 1: mix the opponent's sampling distribution toward bet/raise.
+        # ONLY the sampled action changes — `policy_reservoir.add(strategy, …)`
+        # below still records the true on-policy strategy, so the policy net's
+        # learning target is unchanged. (The traverser's regret estimator IS
+        # biased by this; see config note / spike report.)
+        weights = _aggression_biased_weights(legal_list, probs, opp_aggression_bias)
+        sampled = rng.choices(legal_list, weights=weights, k=1)[0]
+    elif total <= 0:
         sampled = rng.choice(legal_list)
     else:
         sampled = rng.choices(legal_list, weights=probs, k=1)[0]
@@ -263,6 +337,7 @@ def external_sampling_traversal(
         iter_t,
         rng,
         stats,
+        opp_aggression_bias,
     )
 
 
