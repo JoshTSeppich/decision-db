@@ -19,10 +19,13 @@ from zoom.abstraction_gate import (
     DEFAULT_SPR_CAP,
     effective_spr,
     legal_abstract_actions_gated,
+    preflop_all_in_allowed,
 )
 
-from pokerbot.abstraction import ActionType, translate_bet
+from pokerbot.abstraction import ActionType, AbstractionTables, translate_bet
 from pokerbot.abstraction.actions import action_to_byte, byte_to_action_type, legal_abstract_actions
+from pokerbot.training.nlhe_game import SimpleNLHEGame
+from zoom.train.game import GatedNLHEGame
 
 _AGGRO_NON_ALL_IN = {
     ActionType.BET_33,
@@ -234,3 +237,77 @@ def test_check_call_always_survives() -> None:
     ]:
         gated = legal_abstract_actions_gated(pot, to_call, stack, 2, street)  # type: ignore[arg-type]
         assert ActionType.CHECK_CALL in {a.type for a in gated}
+
+
+# ─────────── abstraction-fix Phase 1: the TRAINING game is gated ───────────
+#
+# The function tests above prove the gate predicate. These prove the actual fix:
+# the from-scratch pilot trainer is now a GatedNLHEGame (launcher swap,
+# ABSTRACTION_FIX_SPEC §3), so the deep-stack preflop shove that failed the nc-AI
+# band (POD_RUN_LOG close §③) is never in the trained legal set — while the
+# push/fold-zone jam and a non-shove raise alternative both survive.
+
+
+def _first_preflop_legal(stack: int, **kw: float) -> set[ActionType]:
+    game = GatedNLHEGame(
+        AbstractionTables(),  # type: ignore[arg-type]  # legal_actions needs only pk state
+        table_size=6,
+        starting_stack=stack,
+        **kw,
+    )
+    state = game.new_initial_state(random.Random(0))
+    return {ActionType(a) for a in game.legal_actions(state)}
+
+
+def test_gated_training_game_drops_deep_preflop_shove_keeps_pushfold() -> None:
+    """At 100bb (BB=10 → stack=1000) the first preflop node offers NO ALL_IN but
+    still offers RAISE_2_5X/3_5X; at 20bb (push/fold zone) ALL_IN returns. This is
+    the exact over-admitted cell the abstraction-fix targets, at the game the
+    trainer actually traverses (preflop gate: depth + commitment, not SPR)."""
+    deep = _first_preflop_legal(1000)  # 100bb, default gate
+    assert ActionType.ALL_IN not in deep
+    assert {ActionType.RAISE_2_5X, ActionType.RAISE_3_5X} <= deep  # non-shove aggression preserved
+
+    short = _first_preflop_legal(200)  # 20bb ≤ 25bb depth cap → push/fold zone
+    assert ActionType.ALL_IN in short
+
+
+def test_preflop_eff_bb_inf_reproduces_ungated_simple_game() -> None:
+    """Disabling the depth cut (max_preflop_allin_eff_bb=inf) reproduces the ungated
+    2M behavior: the gated game yields exactly SimpleNLHEGame's preflop legal set."""
+    ungated = _first_preflop_legal(1000, max_preflop_allin_eff_bb=float("inf"))
+    base_game = SimpleNLHEGame(AbstractionTables(), table_size=6, starting_stack=1000)  # type: ignore[arg-type]
+    base = {ActionType(a) for a in base_game.legal_actions(base_game.new_initial_state(random.Random(0)))}
+    assert ungated == base
+    assert ActionType.ALL_IN in ungated
+
+
+# ─────────── the corrected preflop predicate: the six canonical 100bb spots ───────────
+#
+# SPR-only (spr_cap=10) eliminated the unprovoked deep open-jam but MISSED the dominant
+# facing-3bet/4bet deep overshove (50k smoke: facing-deep ALL_IN ~47% unchanged, nc-AI
+# 6.9→6.6%), because facing a raise lowers SPR below the cap. `preflop_all_in_allowed`
+# keys on DEPTH + stack-behind COMMITMENT instead, which separates them. (pot, to_call,
+# stack) are chips at 100bb with BB=10; has_other_aggression=True (a raise is legal).
+
+
+def test_preflop_gate_six_canonical_spots() -> None:
+    keep = lambda pot, tc, st: preflop_all_in_allowed(  # noqa: E731
+        pot, tc, st, 10, has_other_aggression=True
+    )
+    # DROP — deep, uncommitted, non-shove raise available:
+    assert keep(15, 10, 1000) is False  # unopened UTG open, 100bb
+    assert keep(40, 25, 975) is False  # facing a 2.5bb open, 100bb
+    assert keep(130, 65, 975) is False  # facing a 3bet→9bb, 100bb  ← the target SPR missed
+    # KEEP — push/fold depth zone:
+    assert keep(15, 10, 250) is True  # 25bb open (eff_bb == cap)
+    assert keep(15, 10, 120) is True  # 12bb open
+    # KEEP — committed 4bet/5bet shove-war (stack-behind ≈ 1.4 pots):
+    assert keep(335, 130, 780) is True  # facing a 4bet→22bb, 100bb
+
+
+def test_preflop_forced_jam_and_undefined_pot_keep_all_in() -> None:
+    # No non-ALL_IN aggression → forced jam, keep regardless of depth.
+    assert preflop_all_in_allowed(15, 10, 1000, 10, has_other_aggression=False) is True
+    # ref_pot <= 0 → undefined, keep (defensive).
+    assert preflop_all_in_allowed(0, 0, 1000, 10, has_other_aggression=True) is True

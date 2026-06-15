@@ -68,6 +68,24 @@ def test_config_pinned_values_match_spec() -> None:
     assert c.num_players_train == (6, 8, 9)
     assert c.seat_randomization is True
     assert c.seed == 0xC0FFEE
+    # Spike knobs default-OFF / unchanged-path.
+    assert c.opp_aggression_bias == 0.0
+    assert c.coverage_instrument is False
+    # Deep-stack ALL_IN gate (abstraction-fix Phase 1). Defaults must stay in
+    # lockstep with the gate module so train==serve action set; config.py cannot
+    # import zoom, so the parity is asserted here.
+    from zoom.abstraction_gate import (
+        DEFAULT_MAX_PREFLOP_ALLIN_EFF_BB,
+        DEFAULT_PREFLOP_COMMIT_POTS,
+        DEFAULT_SPR_CAP,
+    )
+
+    assert c.allin_spr_cap == 10.0
+    assert c.allin_spr_cap == DEFAULT_SPR_CAP
+    assert c.max_preflop_allin_eff_bb == 25.0
+    assert c.max_preflop_allin_eff_bb == DEFAULT_MAX_PREFLOP_ALLIN_EFF_BB
+    assert c.preflop_allin_commit_pots == 1.5
+    assert c.preflop_allin_commit_pots == DEFAULT_PREFLOP_COMMIT_POTS
 
 
 # ───────── 2. test_traversal_single_hand ─────────

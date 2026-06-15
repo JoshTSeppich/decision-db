@@ -50,7 +50,13 @@ if os.environ.get("PYTHONHASHSEED") != "0":
 
 from pokerbot.abstraction import AbstractionTables
 from pokerbot.strategy_db import open_db
-from pokerbot.training import DeepCFRConfig, SimpleNLHEGame, Trainer
+from pokerbot.training import DeepCFRConfig, Trainer
+
+# Abstraction-fix Phase 1: the from-scratch pilot trains on the SPR-gated action
+# set so it never learns the deep-stack preflop shove that failed the nc-AI band.
+# Composing the gate here (scripts/ may import zoom) keeps frozen src/pokerbot/
+# untouched — actions.py and SimpleNLHEGame are unmodified. See ABSTRACTION_FIX_SPEC §3.
+from zoom.train.game import GatedNLHEGame
 
 # Buffer/cache sizes must be sane before we spend ~6s warming caches and load
 # the abstraction. Floor guards against fat-finger tiny values (a 100-entry
@@ -201,6 +207,40 @@ def build_parser() -> argparse.ArgumentParser:
             "--skip-lbr is set." % DeepCFRConfig().lbr_every
         ),
     )
+    p.add_argument(
+        "--spr-cap",
+        type=float,
+        default=DeepCFRConfig().allin_spr_cap,
+        help=(
+            "POSTFLOP ALL_IN SPR gate (abstraction-fix Phase 1): drop ALL_IN when "
+            "stack/(pot+to_call) > this and a non-shove bet exists (default %.1f; keeps "
+            "low-SPR river jams). Use inf to disable postflop gating."
+            % DeepCFRConfig().allin_spr_cap
+        ),
+    )
+    p.add_argument(
+        "--max-preflop-allin-eff-bb",
+        type=float,
+        default=DeepCFRConfig().max_preflop_allin_eff_bb,
+        help=(
+            "PREFLOP ALL_IN depth cap (abstraction-fix Phase 1): keep ALL_IN only when "
+            "effective stack ≤ this many BB (push/fold zone) or the actor is committed "
+            "(see --preflop-commit-pots); drop the discretionary deep overshove "
+            "otherwise (default %.1fbb). Use inf to disable the depth cut."
+            % DeepCFRConfig().max_preflop_allin_eff_bb
+        ),
+    )
+    p.add_argument(
+        "--preflop-commit-pots",
+        type=float,
+        default=DeepCFRConfig().preflop_allin_commit_pots,
+        help=(
+            "PREFLOP commitment exception: keep deep ALL_IN when stack-behind-after-call "
+            "≤ this many pot-sized bets (real 4bet/5bet shove-war; default %.1f). "
+            "Separates facing-4bet jams (keep) from facing-3bet overshoves (drop)."
+            % DeepCFRConfig().preflop_allin_commit_pots
+        ),
+    )
     return p
 
 
@@ -246,12 +286,32 @@ def main() -> int:
         checkpoint_every=args.checkpoint_every,
         lbr_every=0 if args.skip_lbr else args.lbr_every,
         coverage_instrument=args.coverage_instrument,  # opp_aggression_bias left at default 0.0
+        allin_spr_cap=args.spr_cap,
+        max_preflop_allin_eff_bb=args.max_preflop_allin_eff_bb,
+        preflop_allin_commit_pots=args.preflop_commit_pots,
         seed=args.seed,
     )
     log.info("config: %s", config)
 
-    game = SimpleNLHEGame(tables, table_size=args.table_size)
-    log.info("training at table_size=%d", args.table_size)
+    # GatedNLHEGame (not SimpleNLHEGame): the trainer enumerates the gated action set so
+    # it never explores/learns the deep-stack shove. Preflop gates on DEPTH (eff_bb) +
+    # stack-behind COMMITMENT (SPR mis-targets preflop); postflop on SPR. The gate is a
+    # strict subset (only ever drops ALL_IN), so apply_action — which validates against
+    # the ungated superset — is unaffected. eff_bb=inf + spr=inf reproduces ungated.
+    game = GatedNLHEGame(
+        tables,
+        table_size=args.table_size,
+        spr_cap=config.allin_spr_cap,
+        max_preflop_allin_eff_bb=config.max_preflop_allin_eff_bb,
+        preflop_commit_pots=config.preflop_allin_commit_pots,
+    )
+    log.info(
+        "training at table_size=%d; ALL_IN gate: preflop eff_bb≤%.0f or committed≤%.1fpot, postflop SPR≤%.1f",
+        args.table_size,
+        config.max_preflop_allin_eff_bb,
+        config.preflop_allin_commit_pots,
+        config.allin_spr_cap,
+    )
     # lru_max lives in the abstraction layer, not DeepCFRConfig — record it
     # (and the buffer sizes) in checkpoint metadata for run provenance.
     run_metadata = {

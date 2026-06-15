@@ -24,7 +24,13 @@ from pokerbot.training.nlhe_game import (
     SimpleNLHEGame,
     _pk_card_to_int,  # read-only reuse: pokerkit Card → 0..51 int, identical encoding
 )
-from zoom.abstraction_gate import DEFAULT_SPR_CAP, all_in_allowed
+from zoom.abstraction_gate import (
+    DEFAULT_MAX_PREFLOP_ALLIN_EFF_BB,
+    DEFAULT_PREFLOP_COMMIT_POTS,
+    DEFAULT_SPR_CAP,
+    all_in_allowed,
+    preflop_all_in_allowed,
+)
 from zoom.agents import AgentSpot
 
 if TYPE_CHECKING:
@@ -54,6 +60,8 @@ class GatedNLHEGame(SimpleNLHEGame):
         starting_stack: int = 1000,
         table_size: int = 6,
         spr_cap: float = DEFAULT_SPR_CAP,
+        max_preflop_allin_eff_bb: float = DEFAULT_MAX_PREFLOP_ALLIN_EFF_BB,
+        preflop_commit_pots: float = DEFAULT_PREFLOP_COMMIT_POTS,
     ) -> None:
         super().__init__(
             abstraction,
@@ -61,7 +69,9 @@ class GatedNLHEGame(SimpleNLHEGame):
             starting_stack=starting_stack,
             table_size=table_size,  # type: ignore[arg-type]
         )
-        self.spr_cap = spr_cap
+        self.spr_cap = spr_cap  # postflop ALL_IN SPR gate
+        self.max_preflop_allin_eff_bb = max_preflop_allin_eff_bb  # preflop depth cap
+        self.preflop_commit_pots = preflop_commit_pots  # preflop commitment exception
 
     def _gate_context(self, state: NLHEState) -> tuple[int, int, int]:
         """(pot, to_call, stack) for the current actor — the gate's inputs."""
@@ -76,13 +86,27 @@ class GatedNLHEGame(SimpleNLHEGame):
         base = self._legal_abstract_at(state)  # ungated abstract actions (pk-gated)
         has_other_aggression = any(a.type in _AGGRESSIVE_NON_ALL_IN for a in base)
         pot, to_call, stack = self._gate_context(state)
-        if all_in_allowed(
-            pot,
-            to_call,
-            stack,
-            has_other_aggression=has_other_aggression,
-            spr_cap=self.spr_cap,
-        ):
+        street = _STREET_NAMES[int(state.pk_state.street_index)]
+        if street == "preflop":
+            # Depth + stack-behind commitment (SPR mis-targets preflop — see gate module).
+            keep_all_in = preflop_all_in_allowed(
+                pot,
+                to_call,
+                stack,
+                self.blinds[1],
+                has_other_aggression=has_other_aggression,
+                max_eff_bb=self.max_preflop_allin_eff_bb,
+                commit_pots=self.preflop_commit_pots,
+            )
+        else:
+            keep_all_in = all_in_allowed(
+                pot,
+                to_call,
+                stack,
+                has_other_aggression=has_other_aggression,
+                spr_cap=self.spr_cap,
+            )
+        if keep_all_in:
             return tuple(int(a.type) for a in base)
         return tuple(int(a.type) for a in base if a.type != ActionType.ALL_IN)
 

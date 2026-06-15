@@ -49,7 +49,29 @@ if TYPE_CHECKING:
 # Default stack-to-pot ratio above which ALL_IN is no longer offered as an abstract
 # action. ~10 keeps shoves through the push/fold zone (≲25bb preflop opens) and drops
 # the spazzy deep-stack overbet shove. The one knob Component 5 tunes.
+#
+# NOTE (abstraction-fix Phase 1): SPR is the POSTFLOP gate. It is the WRONG lever for
+# PREFLOP: facing a raise lowers SPR below the cap, so a 100bb facing-3bet 4bet-jam
+# (SPR≈5) survives while a legitimate 25bb open-jam (SPR≈10) is the higher-SPR spot —
+# SPR conflates depth and pot-commitment in opposite directions, so no single cap
+# separates them (50k gated smoke: unopened-deep ALL_IN 100%→0% but facing-deep ~47%
+# unchanged; nc-AI 6.9→6.6%). Preflop therefore uses `preflop_all_in_allowed` below,
+# which gates on DEPTH (eff_bb) and stack-behind COMMITMENT as orthogonal axes.
 DEFAULT_SPR_CAP: Final[float] = 10.0
+
+# Preflop depth cap (effective stack in BB) at/below which ALL_IN stays legal — the
+# push/fold zone where open-/3bet-jamming is genuine GTO. Above it a preflop ALL_IN is
+# the discretionary deep overshove the nc-AI band forbids, UNLESS the actor is committed
+# (see DEFAULT_PREFLOP_COMMIT_POTS). ~25bb is the standard top of the push/fold zone.
+DEFAULT_MAX_PREFLOP_ALLIN_EFF_BB: Final[float] = 25.0
+
+# Preflop commitment exception: keep ALL_IN even when deep iff the stack remaining AFTER
+# calling is at most this many pot-sized bets — i.e. the actor is already in a 4bet/5bet
+# shove-war where the jam is the real abstract size. Keyed on STACK-BEHIND (stack −
+# to_call), NOT on to_call: a 100bb facing-3bet jam has a large to_call yet ~4.7 pots
+# still behind (discretionary → dropped); a 100bb facing-4bet jam has ~1.4 pots behind
+# (committed → kept). ~1.5 separates them.
+DEFAULT_PREFLOP_COMMIT_POTS: Final[float] = 1.5
 
 # Bet/raise actions other than ALL_IN. If any of these is legal, ALL_IN is not the
 # *only* aggressive option, so the SPR rule is allowed to remove it; if none is, the
@@ -99,6 +121,44 @@ def all_in_allowed(
     return stack <= spr_cap * ref_pot  # spr <= spr_cap, division-free
 
 
+def preflop_all_in_allowed(
+    pot: int,
+    to_call: int,
+    stack: int,
+    bb: int,
+    *,
+    has_other_aggression: bool,
+    max_eff_bb: float = DEFAULT_MAX_PREFLOP_ALLIN_EFF_BB,
+    commit_pots: float = DEFAULT_PREFLOP_COMMIT_POTS,
+) -> bool:
+    """Keep-ALL_IN predicate for PREFLOP (one source of truth for the preflop gate).
+
+    ALL_IN stays available iff ANY of:
+      * it's the only aggression (forced jam — no non-ALL_IN raise fits the stack), or
+      * the reference pot is non-positive (undefined — keep, defensive), or
+      * the effective stack is short — ``eff_bb <= max_eff_bb`` — the push/fold zone
+        where open-/3bet-jamming is genuine GTO (rescued by DEPTH regardless of pot,
+        which is exactly what SPR alone could not do), or
+      * the actor is COMMITTED — stack remaining after calling is at most
+        ``commit_pots`` pot-sized bets — a real 4bet/5bet shove-war.
+
+    Otherwise ALL_IN is DROPPED: deep, uncommitted, with a non-shove raise available —
+    the discretionary deep overshove (incl. the facing-3bet-100bb 4bet-jam) the nc-AI
+    band forbids. Depth (eff_bb) and commitment (stack-behind) are ORTHOGONAL axes; SPR
+    conflated them, so this gate keys on each directly.
+    """
+    if not has_other_aggression:
+        return True
+    ref_pot = pot + to_call
+    if ref_pot <= 0:
+        return True
+    eff_bb = stack / bb if bb > 0 else float("inf")
+    if eff_bb <= max_eff_bb:
+        return True  # push/fold zone — depth keeps the jam regardless of pot
+    stack_behind_after_call = stack - to_call
+    return stack_behind_after_call <= commit_pots * ref_pot  # committed shove-war
+
+
 def legal_abstract_actions_gated(
     pot: int,
     to_call: int,
@@ -124,8 +184,11 @@ def legal_abstract_actions_gated(
 
 
 __all__ = [
+    "DEFAULT_MAX_PREFLOP_ALLIN_EFF_BB",
+    "DEFAULT_PREFLOP_COMMIT_POTS",
     "DEFAULT_SPR_CAP",
     "all_in_allowed",
     "effective_spr",
     "legal_abstract_actions_gated",
+    "preflop_all_in_allowed",
 ]
